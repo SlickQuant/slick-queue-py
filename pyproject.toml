@@ -3,7 +3,7 @@ requires = ["setuptools>=45", "wheel", "setuptools-scm"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "slick_queue_py"
+name = "slick-queue-py"
 dynamic = ["version"]
 description = "Lock-free MPMC queue with C++ interoperability via shared memory"
 readme = "README.md"
@@ -32,10 +32,10 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/SlickQuant/slick_queue_py"
-Documentation = "https://github.com/SlickQuant/slick_queue_py#readme"
-Repository = "https://github.com/SlickQuant/slick_queue_py"
-"Bug Tracker" = "https://github.com/SlickQuant/slick_queue_py/issues"
+Homepage = "https://github.com/SlickQuant/slick-queue-py"
+Documentation = "https://github.com/SlickQuant/slick-queue-py#readme"
+Repository = "https://github.com/SlickQuant/slick-queue-py"
+"Bug Tracker" = "https://github.com/SlickQuant/slick-queue-py/issues"
 
 [tool.setuptools]
 py-modules = ["slick_queue_py", "atomic_ops"]

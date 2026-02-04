@@ -1,4 +1,4 @@
-{% set name = "slick_queue_py" %}
+{% set name = "slick-queue-py" %}
 {% set version = "1.0.1" %}
 
 package:
@@ -14,7 +14,7 @@ source:
   # sha256: <will be generated after first PyPI upload>
 
   # Option 3: From Git (use this after GitHub publication)
-  # git_url: https://github.com/SlickQuant/slick_queue_py.git
+  # git_url: https://github.com/SlickQuant/slick-queue-py.git
   # git_rev: v{{ version }}
 
 build:
@@ -45,7 +45,7 @@ test:
     - python -c "from atomic_ops import check_platform_support; print(check_platform_support())"
 
 about:
-  home: https://github.com/SlickQuant/slick_queue_py
+  home: https://github.com/SlickQuant/slick-queue-py
   license: MIT
   license_file: LICENSE
   summary: Lock-free MPMC queue with C++ interoperability via shared memory
@@ -59,8 +59,8 @@ about:
     - C++/Python Interoperability
     - Cross-Platform (Windows, Linux, macOS)
     - High Performance with hardware atomic operations
-  doc_url: https://github.com/SlickQuant/slick_queue_py#readme
-  dev_url: https://github.com/SlickQuant/slick_queue_py
+  doc_url: https://github.com/SlickQuant/slick-queue-py#readme
+  dev_url: https://github.com/SlickQuant/slick-queue-py
 
 extra:
   recipe-maintainers:

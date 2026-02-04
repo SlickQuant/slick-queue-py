@@ -30,18 +30,18 @@ atomic_ops_ext = Extension(
 )
 
 setup(
-    name='slick_queue_py',
+    name='slick-queue-py',
     version=get_version(),
     description='Lock-free MPMC queue with C++ interoperability via shared memory',
     long_description=get_long_description(),
     long_description_content_type='text/markdown',
     author='Slick Quant',
     author_email='slickquant@slickquant.com',
-    url='https://github.com/SlickQuant/slick_queue_py',
+    url='https://github.com/SlickQuant/slick-queue-py',
     project_urls={
-        'Bug Tracker': 'https://github.com/SlickQuant/slick_queue_py/issues',
-        'Documentation': 'https://github.com/SlickQuant/slick_queue_py#readme',
-        'Source Code': 'https://github.com/SlickQuant/slick_queue_py',
+        'Bug Tracker': 'https://github.com/SlickQuant/slick-queue-py/issues',
+        'Documentation': 'https://github.com/SlickQuant/slick-queue-py#readme',
+        'Source Code': 'https://github.com/SlickQuant/slick-queue-py',
     },
     classifiers=[
         'Development Status :: 4 - Beta',

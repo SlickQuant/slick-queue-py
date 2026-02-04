@@ -168,13 +168,13 @@ jobs:
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "**Via pip (PyPI):**" >> $GITHUB_STEP_SUMMARY
         echo '```bash' >> $GITHUB_STEP_SUMMARY
-        echo "pip install slick_queue_py" >> $GITHUB_STEP_SUMMARY
+        echo "pip install slick-queue-py" >> $GITHUB_STEP_SUMMARY
         echo '```' >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
         if [ "${{ needs.publish-conda.result }}" == "success" ]; then
           echo "**Via conda:**" >> $GITHUB_STEP_SUMMARY
           echo '```bash' >> $GITHUB_STEP_SUMMARY
-          echo "conda install -c ${{ github.repository_owner }} slick_queue_py" >> $GITHUB_STEP_SUMMARY
+          echo "conda install -c ${{ github.repository_owner }} slick-queue-py" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
         else
@@ -182,7 +182,7 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
         fi
         echo "### Links" >> $GITHUB_STEP_SUMMARY
-        echo "- PyPI: https://pypi.org/project/slick_queue_py/" >> $GITHUB_STEP_SUMMARY
+        echo "- PyPI: https://pypi.org/project/slick-queue-py/" >> $GITHUB_STEP_SUMMARY
         if [ "${{ needs.publish-conda.result }}" == "success" ]; then
-          echo "- Anaconda: https://anaconda.org/${{ github.repository_owner }}/slick_queue_py" >> $GITHUB_STEP_SUMMARY
+          echo "- Anaconda: https://anaconda.org/${{ github.repository_owner }}/slick-queue-py" >> $GITHUB_STEP_SUMMARY
         fi

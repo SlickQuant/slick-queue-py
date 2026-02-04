@@ -1,5 +1,10 @@
 # Changelogs
 
+## [unreleased]
+
+### Changed
+- Changed repository name from slick_queue_py to slick-queue-py
+
 ## [v1.0.1] - 2025-12-27
 
 ### Fixed

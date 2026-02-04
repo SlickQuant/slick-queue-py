@@ -1,12 +1,12 @@
-# slick_queue_py
+# slick-queue-py
 
 Python implementation of SlickQueue - a lock-free multi-producer multi-consumer (MPMC) queue with C++ interoperability through shared memory.
 
-This is the Python binding for the [SlickQueue C++ library](https://github.com/SlickQuant/slick_queue). The Python implementation maintains exact binary compatibility with the C++ version, enabling seamless interprocess communication between Python and C++ applications.
+This is the Python binding for the [SlickQueue C++ library](https://github.com/SlickQuant/slick-queue). The Python implementation maintains exact binary compatibility with the C++ version, enabling seamless interprocess communication between Python and C++ applications.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![CI](https://github.com/SlickQuant/slick_queue_py/actions/workflows/ci.yml/badge.svg)](https://github.com/SlickQuant/slick_queue_py/actions/workflows/ci.yml)
-[![GitHub release](https://img.shields.io/github/v/release/SlickQuant/slick_queue_py)](https://github.com/SlickQuant/slick_queue_py/releases)
+[![CI](https://github.com/SlickQuant/slick-queue_py/actions/workflows/ci.yml/badge.svg)](https://github.com/SlickQuant/slick-queue-py/actions/workflows/ci.yml)
+[![GitHub release](https://img.shields.io/github/v/release/SlickQuant/slick-queue-py)](https://github.com/SlickQuant/slick-queue-py/releases)
 
 ## Features
 
@@ -766,7 +766,7 @@ This ensures:
 
 ## Contributing
 
-Issues and pull requests welcome at [SlickQuant/slick_queue_py](https://github.com/SlickQuant/slick_queue_py).
+Issues and pull requests welcome at [SlickQuant/slick-queue-py](https://github.com/SlickQuant/slick-queue-py).
 
 ## License
 
