@@ -1,39 +1,42 @@
 include(FetchContent)
 
-# Fetch slick_queue from GitHub
+# Fetch slick-queue from GitHub
 set(BUILD_SLICK_QUEUE_TESTS OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
-    slick_queue
-    GIT_REPOSITORY https://github.com/SlickQuant/slick_queue.git
+    slick-queue
+    GIT_REPOSITORY https://github.com/SlickQuant/slick-queue.git
     GIT_TAG main
 )
-FetchContent_MakeAvailable(slick_queue)
+FetchContent_MakeAvailable(slick-queue)
 
 set(SLICK_SHM_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(SLICK_SHM_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(SLICK_SHM_INSTALL OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
-    slick_shm
-    GIT_REPOSITORY https://github.com/SlickQuant/slick_shm.git
+    slick-shm
+    GIT_REPOSITORY https://github.com/SlickQuant/slick-shm.git
     GIT_TAG main
 )
-FetchContent_MakeAvailable(slick_shm)
+FetchContent_MakeAvailable(slick-shm)
 
 # Find Python
 find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
 
 # Create interop test executables
 add_executable(cpp_producer cpp_producer.cpp)
-target_link_libraries(cpp_producer PRIVATE slick_queue)
+target_link_libraries(cpp_producer PRIVATE slick::queue)
 
 add_executable(cpp_consumer cpp_consumer.cpp)
-target_link_libraries(cpp_consumer PRIVATE slick_queue)
+target_link_libraries(cpp_consumer PRIVATE slick::queue)
 
 add_executable(cpp_work_stealing_consumer cpp_work_stealing_consumer.cpp)
-target_link_libraries(cpp_work_stealing_consumer PRIVATE slick_queue slick_shm)
+target_link_libraries(cpp_work_stealing_consumer PRIVATE slick::queue slick::shm)
 
 add_executable(cpp_multi_producer cpp_multi_producer.cpp)
-target_link_libraries(cpp_multi_producer PRIVATE slick_queue)
+target_link_libraries(cpp_multi_producer PRIVATE slick::queue)
+
+add_executable(cpp_read_last_tester cpp_read_last_tester.cpp)
+target_link_libraries(cpp_read_last_tester PRIVATE slick::queue)
 
 # Platform-specific linking and compilation flags
 if(UNIX AND NOT APPLE)
@@ -42,12 +45,14 @@ if(UNIX AND NOT APPLE)
     target_link_libraries(cpp_consumer PRIVATE pthread rt)
     target_link_libraries(cpp_work_stealing_consumer PRIVATE pthread rt)
     target_link_libraries(cpp_multi_producer PRIVATE pthread rt)
+    target_link_libraries(cpp_read_last_tester PRIVATE pthread rt)
 elseif(APPLE)
     # macOS only needs pthread
     target_link_libraries(cpp_producer PRIVATE pthread)
     target_link_libraries(cpp_consumer PRIVATE pthread)
     target_link_libraries(cpp_work_stealing_consumer PRIVATE pthread)
     target_link_libraries(cpp_multi_producer PRIVATE pthread)
+    target_link_libraries(cpp_read_last_tester PRIVATE pthread)
 endif()
 
 # Add Python interop tests
@@ -100,6 +105,24 @@ add_test(
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 )
 
+add_test(
+    NAME read_last_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/test_read_last.py
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+)
+
+add_test(
+    NAME read_last_interop_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/test_read_last_interop.py
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+)
+
+add_test(
+    NAME modern_format_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/test_modern_format.py
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+)
+
 # Set timeouts for all tests to prevent CI hangs
 set_tests_properties(
     atomic_ops_test
@@ -110,5 +133,8 @@ set_tests_properties(
     python_producer_cpp_consumer
     cpp_producer_python_consumer
     multi_producer_interop
+    read_last_test
+    read_last_interop_test
+    modern_format_test
     PROPERTIES TIMEOUT 120
 )

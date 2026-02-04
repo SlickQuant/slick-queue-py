@@ -241,7 +241,7 @@ q.unlink()
 
 ### C++/Python Interoperability
 
-The Python implementation is fully compatible with the C++ [SlickQueue](https://github.com/SlickQuant/slick_queue) library. Python and C++ processes can produce and consume from the same queue with:
+The Python implementation is fully compatible with the C++ [SlickQueue](https://github.com/SlickQuant/slick-queue) library. Python and C++ processes can produce and consume from the same queue with:
 
 - **Exact memory layout compatibility**: Binary-compatible with `slick::SlickQueue<T>`
 - **Atomic operation compatibility**: Same 16-byte and 8-byte CAS semantics
@@ -297,10 +297,10 @@ To use the C++ SlickQueue library with your Python queues:
 
 ```bash
 # Clone the C++ library
-git clone https://github.com/SlickQuant/slick_queue.git
+git clone https://github.com/SlickQuant/slick-queue.git
 
 # Build your C++ program
-g++ -std=c++17 -I slick_queue/include my_program.cpp -o my_program
+g++ -std=c++17 -I slick-queue/include my_program.cpp -o my_program
 ```
 
 Or use CMake (see [CMakeLists.txt](CMakeLists.txt) for reference):
@@ -308,14 +308,14 @@ Or use CMake (see [CMakeLists.txt](CMakeLists.txt) for reference):
 ```cmake
 include(FetchContent)
 FetchContent_Declare(
-    slick_queue
-    GIT_REPOSITORY https://github.com/SlickQuant/slick_queue.git
+    slick-queue
+    GIT_REPOSITORY https://github.com/SlickQuant/slick-queue.git
     GIT_TAG main
 )
-FetchContent_MakeAvailable(slick_queue)
+FetchContent_MakeAvailable(slick-queue)
 
 add_executable(my_program my_program.cpp)
-target_link_libraries(my_program PRIVATE slick_queue)
+target_link_libraries(my_program PRIVATE slick::queue)
 ```
 
 See [tests/test_interop.py](tests/test_interop.py) and [tests/cpp_*.cpp](tests/) for comprehensive examples.
@@ -453,12 +453,21 @@ while True:
         process(data)
 ```
 
-#### `read_last() -> Optional[bytes]`
+#### `read_last() -> Tuple[Optional[bytes], int]`
 
 Read the most recently published item.
 
 **Returns:**
-- `Optional[bytes]`: Last published data or None
+- `Tuple[Optional[bytes], int]`: Tuple of (data, size)
+  - `data`: Last published data or None if queue is empty
+  - `size`: Number of slots the item occupies (0 if queue is empty)
+
+**Example:**
+```python
+data, size = q.read_last()
+if data is not None:
+    print(f"Last item: {data[:size * element_size]}")
+```
 
 #### `__getitem__(index) -> memoryview`
 

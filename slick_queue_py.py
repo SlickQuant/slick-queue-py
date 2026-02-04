@@ -31,11 +31,32 @@ from atomic_ops import AtomicReservedInfo, AtomicUInt64, AtomicCursor, check_pla
 from multiprocessing.shared_memory import SharedMemory
 
 # Layout constants
-# Note: We add 8 bytes of padding at the start to ensure the atomic data (at offset 16)
-# is 16-byte aligned for CMPXCHG16B instruction compatibility
+# Shared memory header layout (64 bytes total):
+# Offset 0-7:   std::atomic<reserved_info> (8 bytes)
+# Offset 8-11:  size_ (uint32_t)
+# Offset 12-15: element_size (uint32_t)
+# Offset 16-23: std::atomic<uint64_t> last_published_ (8 bytes)
+# Offset 24-27: header_magic (uint32_t) - value 0x534C5131 ('SLQ1')
+# Offset 28-47: PADDING (20 bytes)
+# Offset 48-51: init_state (atomic uint32_t)
+# Offset 52-63: PADDING (12 bytes)
 HEADER_SIZE = 64
-# reserved_info with alignment padding: 32 bytes (8+8+8+4+4)
-RESERVED_INFO_SIZE = struct.calcsize(AtomicReservedInfo.RESERVED_INFO_FMT)
+RESERVED_INFO_SIZE = struct.calcsize(AtomicReservedInfo.RESERVED_INFO_FMT)  # 8 bytes
+SIZE_OFFSET = 8
+ELEMENT_SIZE_OFFSET = 12
+LAST_PUBLISHED_OFFSET = 16
+HEADER_MAGIC_OFFSET = 24
+HEADER_MAGIC = 0x534C5131  # 'SLQ1' in little-endian
+INIT_STATE_OFFSET = 48
+
+# Init state constants (matches C++ queue.h)
+INIT_STATE_UNINITIALIZED = 0
+INIT_STATE_LEGACY = 1
+INIT_STATE_INITIALIZING = 2
+INIT_STATE_READY = 3
+
+# Invalid index constant
+K_INVALID_INDEX = 2**64 - 1
 
 # slot: atomic_uint64 data_index; uint32 size; 4 bytes padding => 16 bytes
 SLOT_FMT = "<Q I 4x"
@@ -81,6 +102,8 @@ class SlickQueue:
         self._local_buf: Optional[bytearray] = None
         self.size = None
         self._own = False
+        self._last_published_valid = False
+        self._atomic_last_published = None
 
         # Validate parameters
         if size is not None:
@@ -102,22 +125,60 @@ class SlickQueue:
                 try:
                     self._shm = SharedMemory(name=self.name, create=True, size=total)
                     # print(f"**** create new shm {self.name}")
-                    # initialize header: reserved_info zeros, size
-                    buf = self._shm.buf
-                    buf[:HEADER_SIZE] = bytes(HEADER_SIZE)
-                    struct.pack_into("<I I", buf, RESERVED_INFO_SIZE, self.size, element_size)
-                    # initialize slots data_index to max (uint64 max)
-                    for i in range(self.size):
-                        off = HEADER_SIZE + i * SLOT_SIZE
-                        struct.pack_into(SLOT_FMT, buf, off, (2**64 - 1), 1)
-                    self._own = True
                 except FileExistsError:
-                    # print(f"**** open existing shm {self.name}")
-                    # Queue already exists, open it (size is ignored for existing shm on Linux/Mac)
+                    # print(f"**** shm already exists, opening {self.name}")
                     self._shm = SharedMemory(name=self.name, create=False)
 
-                    # Validate the size in the header matches what we expect
-                    ss = struct.unpack_from("<I I", self._shm.buf, RESERVED_INFO_SIZE)
+                # Use CAS on init_state to determine ownership (matches C++ queue.h:618-648)
+                buf = self._shm.buf
+                init_state_atomic = AtomicUInt64(buf, INIT_STATE_OFFSET)
+
+                # Try to atomically claim ownership by CAS from UNINITIALIZED to INITIALIZING
+                success, actual_state = init_state_atomic.compare_exchange_weak(
+                    INIT_STATE_UNINITIALIZED, INIT_STATE_INITIALIZING
+                )
+
+                if success:
+                    # We are the creator - initialize the queue (matches C++ queue.h:622-647)
+                    self._own = True
+
+                    # Write header_magic at offset 24
+                    struct.pack_into("<I", buf, HEADER_MAGIC_OFFSET, HEADER_MAGIC)
+
+                    # Initialize reserved_info atomic at offset 0
+                    atomic_reserved = AtomicReservedInfo(buf, 0)
+                    # This stores packed (index=0, size=0)
+                    struct.pack_into("<Q", buf, 0, 0)
+
+                    # Initialize last_published at offset 16 with kInvalidIndex
+                    struct.pack_into("<Q", buf, LAST_PUBLISHED_OFFSET, K_INVALID_INDEX)
+                    self._last_published_valid = True
+
+                    # Write size and element_size at offsets 8 and 12
+                    struct.pack_into("<I I", buf, SIZE_OFFSET, self.size, element_size)
+
+                    # Initialize slots data_index to max (uint64 max)
+                    for i in range(self.size):
+                        off = HEADER_SIZE + i * SLOT_SIZE
+                        struct.pack_into(SLOT_FMT, buf, off, K_INVALID_INDEX, 1)
+
+                    # Mark initialization complete
+                    init_state_atomic.store_release(INIT_STATE_READY)
+
+                else:
+                    # Opened existing - wait for initialization and validate (matches C++ queue.h:649-684)
+                    self._own = False
+
+                    # Wait for initialization to complete
+                    if not self._wait_for_shared_memory_ready(buf):
+                        self._shm.close()
+                        raise RuntimeError("Timed out waiting for shared memory initialization")
+
+                    # Detect format version
+                    self._last_published_valid = self._detect_format_version(buf)
+
+                    # Read and validate metadata
+                    ss = struct.unpack_from("<I I", buf, SIZE_OFFSET)
                     if ss[0] != self.size:
                         self._shm.close()
                         raise ValueError(f"size mismatch. Expected {self.size} but got {ss[0]}")
@@ -132,9 +193,18 @@ class SlickQueue:
 
                 # Open existing shared memory (size parameter not needed/ignored)
                 self._shm = SharedMemory(name=self.name, create=False)
+                buf = self._shm.buf
+
+                # Wait for initialization to complete (matches C++ queue.h:558-562)
+                if not self._wait_for_shared_memory_ready(buf):
+                    self._shm.close()
+                    raise RuntimeError("Timed out waiting for shared memory initialization")
+
+                # Detect format version (matches C++ queue.h:564-570)
+                self._last_published_valid = self._detect_format_version(buf)
 
                 # Read actual queue size from header
-                ss = struct.unpack_from("<I I", self._shm.buf, RESERVED_INFO_SIZE)
+                ss = struct.unpack_from("<I I", buf, SIZE_OFFSET)
                 self.size = ss[0]
                 elem_sz = ss[1]
 
@@ -155,6 +225,10 @@ class SlickQueue:
             for i in range(self.size):
                 slot_offset = HEADER_SIZE + i * SLOT_SIZE
                 self._atomic_slots.append(AtomicUInt64(self._buf, slot_offset))
+
+            # Initialize last_published atomic if modern format
+            if self._last_published_valid:
+                self._atomic_last_published = AtomicUInt64(self._buf, LAST_PUBLISHED_OFFSET)
         else:
             # Local memory mode (C++ with shm_name == nullptr)
             if size is None or element_size is None:
@@ -165,14 +239,22 @@ class SlickQueue:
             total = HEADER_SIZE + SLOT_SIZE * self.size + self.element_size * self.size
             self._local_buf = bytearray(total)
 
-            # Initialize header
+            # Initialize header with modern format (local mode always uses modern format)
             self._local_buf[:HEADER_SIZE] = bytes(HEADER_SIZE)
-            struct.pack_into("<I", self._local_buf, RESERVED_INFO_SIZE, self.size)
+            # Write size at offset 8
+            struct.pack_into("<I I", self._local_buf, SIZE_OFFSET, self.size, element_size)
+            # Initialize last_published at offset 16 with kInvalidIndex
+            struct.pack_into("<Q", self._local_buf, LAST_PUBLISHED_OFFSET, K_INVALID_INDEX)
+            # Write header_magic at offset 24
+            struct.pack_into("<I", self._local_buf, HEADER_MAGIC_OFFSET, HEADER_MAGIC)
+            # Write init_state = READY at offset 48
+            struct.pack_into("<I", self._local_buf, INIT_STATE_OFFSET, INIT_STATE_READY)
+            self._last_published_valid = True
 
             # Initialize slots data_index to max
             for i in range(self.size):
                 off = HEADER_SIZE + i * SLOT_SIZE
-                struct.pack_into(SLOT_FMT, self._local_buf, off, (2**64 - 1), 1)
+                struct.pack_into(SLOT_FMT, self._local_buf, off, K_INVALID_INDEX, 1)
 
             # Create a memoryview for consistency with shared memory path
             self._buf = memoryview(self._local_buf)
@@ -180,12 +262,65 @@ class SlickQueue:
             self._data_offset = HEADER_SIZE + SLOT_SIZE * self.size
 
             # Initialize atomic wrappers (these work on local memory too)
-            # Local mode is always Python creator, but we still pass offset for consistency
             self._atomic_reserved = AtomicReservedInfo(self._buf, 0)
             self._atomic_slots = []
             for i in range(self.size):
                 slot_offset = HEADER_SIZE + i * SLOT_SIZE
                 self._atomic_slots.append(AtomicUInt64(self._buf, slot_offset))
+
+            # Initialize last_published atomic (local mode always uses modern format)
+            self._atomic_last_published = AtomicUInt64(self._buf, LAST_PUBLISHED_OFFSET)
+
+    @staticmethod
+    def _wait_for_shared_memory_ready(buf: memoryview) -> bool:
+        """
+        Wait for shared memory initialization to complete.
+        Matches C++ queue.h:510-534.
+
+        Args:
+            buf: Memory buffer to check
+
+        Returns:
+            True if initialization completed successfully, False if timed out
+        """
+        import time
+        init_state_atomic = AtomicUInt64(buf, INIT_STATE_OFFSET)
+        max_wait_ms = 2000
+        legacy_grace_ms = 5
+
+        for i in range(max_wait_ms):
+            state = init_state_atomic.load_acquire()
+            if state == INIT_STATE_READY:
+                return True
+
+            if state == INIT_STATE_LEGACY and i >= legacy_grace_ms:
+                # Legacy format: check if size and element_size are non-zero
+                ss = struct.unpack_from("<I I", buf, SIZE_OFFSET)
+                if ss[0] != 0 and ss[1] != 0:
+                    return True
+
+            time.sleep(0.001)
+
+        return False
+
+    @staticmethod
+    def _detect_format_version(buf: memoryview) -> bool:
+        """
+        Detect if the queue uses modern format with last_published.
+        Matches C++ queue.h:564-570.
+
+        Args:
+            buf: Memory buffer to check
+
+        Returns:
+            True if modern format (last_published_valid), False for legacy
+        """
+        init_state_atomic = AtomicUInt64(buf, INIT_STATE_OFFSET)
+        state = init_state_atomic.load_acquire()
+        if state == INIT_STATE_READY:
+            magic = struct.unpack_from("<I", buf, HEADER_MAGIC_OFFSET)[0]
+            return magic == HEADER_MAGIC
+        return False
 
     # low-level helpers
     def _read_reserved(self) -> Tuple[int, int]:
@@ -291,7 +426,7 @@ class SlickQueue:
         """
         Publish data written to reserved space (atomic with release semantics).
 
-        Makes the data visible to consumers. Matches C++ queue.h:239-242.
+        Makes the data visible to consumers. Matches C++ queue.h:325-338.
 
         Args:
             index: Index returned by reserve()
@@ -303,9 +438,22 @@ class SlickQueue:
         size_offset = self._control_offset + slot_idx * SLOT_SIZE + 8
         struct.pack_into("<I 4x", self._buf, size_offset, n)
 
-        # Atomic store of data_index with memory_order_release (C++ line 242)
+        # Atomic store of data_index with memory_order_release (C++ line 329)
         # This ensures all data writes are visible before the index is published
         self._atomic_slots[slot_idx].store_release(index)
+
+        # Update last_published if modern format (C++ lines 331-337)
+        if self._last_published_valid:
+            while True:
+                current = self._atomic_last_published.load_acquire()
+                # Only update if current is invalid or less than our index
+                if current != K_INVALID_INDEX and current >= index:
+                    break
+                success, _ = self._atomic_last_published.compare_exchange_weak(
+                    current, index
+                )
+                if success:
+                    break
 
     def __getitem__(self, index: int) -> memoryview:
         off = self._data_offset + (index & self.mask) * self.element_size
@@ -453,27 +601,59 @@ class SlickQueue:
 
             # CAS failed, another consumer claimed it, retry
 
-    def read_last(self) -> Optional[bytes]:
-        reserved_index, reserved_size = self._read_reserved()
-        if reserved_index == 0:
-            return None
-        index = reserved_index - reserved_size
-        off = self._data_offset + (index & self.mask) * self.element_size
-        return bytes(self._buf[off: off + self.element_size])
+    def read_last(self) -> Tuple[Optional[bytes], int]:
+        """
+        Read the last published data in the queue.
+
+        Matches C++ queue.h:439-458.
+
+        Returns:
+            Tuple of (data_bytes or None, item_size).
+            If no data available returns (None, 0).
+        """
+        if self._last_published_valid:
+            # Modern format: use last_published atomic (C++ lines 440-446)
+            last_index = self._atomic_last_published.load_acquire()
+            if last_index == K_INVALID_INDEX:
+                return None, 0
+
+            # Read slot size from control array
+            slot_idx = last_index & self.mask
+            size_offset = self._control_offset + slot_idx * SLOT_SIZE + 8
+            slot_size = struct.unpack_from("<I", self._buf, size_offset)[0]
+
+            # Read data
+            data_off = self._data_offset + slot_idx * self.element_size
+            data = bytes(self._buf[data_off: data_off + slot_size * self.element_size])
+            return data, slot_size
+        else:
+            # Legacy format: use reserved_info (C++ lines 449-457)
+            reserved_index, reserved_size = self._read_reserved()
+            if reserved_index == 0:
+                return None, 0
+            last_index = reserved_index - reserved_size
+            off = self._data_offset + (last_index & self.mask) * self.element_size
+            data = bytes(self._buf[off: off + reserved_size * self.element_size])
+            return data, reserved_size
     
     def reset(self) -> None:
         """Reset the queue to its initial state.
 
         This is a low-level operation that should be used with caution.
         It is typically used in testing or when the queue needs to be reinitialized.
+        Matches C++ queue.h:465-477.
         """
         # Reset all slots to their initial state
         for i in range(self.size):
-            self._write_slot(i, 2**64 - 1, 1)
+            self._write_slot(i, K_INVALID_INDEX, 1)
 
-        if (self.use_shm):
+        if self.use_shm:
             # Reset reserved_info to initial state
             self._write_reserved(0, 0)
+
+        # Reset last_published if modern format (C++ line 473)
+        if self._last_published_valid:
+            self._atomic_last_published.store_release(K_INVALID_INDEX)
 
     def close(self) -> None:
         """Close the queue connection.
@@ -491,6 +671,11 @@ class SlickQueue:
                 for slot in self._atomic_slots:
                     slot.release()
             self._atomic_slots = None
+
+            # Release last_published atomic if it exists
+            if hasattr(self, '_atomic_last_published') and self._atomic_last_published:
+                self._atomic_last_published.release()
+            self._atomic_last_published = None
 
             self._buf = None
 

@@ -4,7 +4,7 @@ Platform-specific atomic operations for lock-free multi-producer multi-consumer 
 This module provides atomic compare-and-swap (CAS) operations and memory barriers
 that match the C++ std::atomic semantics used in slick::SlickQueue.
 
-As of slick_queue v1.2.0+, reserved_info is a packed uint64_t (not a struct):
+As of slick-queue v1.2.0+, reserved_info is a packed uint64_t (not a struct):
 - Bits 0-15: size (16-bit, max 65535)
 - Bits 16-63: index (48-bit, max 281 trillion)
 
@@ -30,7 +30,7 @@ from typing import Tuple, Optional, Union
 from enum import IntEnum
 
 
-# Bit packing/unpacking helpers for reserved_info (matches C++ slick_queue v1.2.0+)
+# Bit packing/unpacking helpers for reserved_info (matches C++ slick-queue v1.2.0+)
 # reserved_info is a uint64_t with: [48-bit index | 16-bit size]
 def make_reserved_info(index: int, size: int) -> int:
     """Pack index (48-bit) and size (16-bit) into uint64_t.
@@ -371,7 +371,7 @@ class AtomicReservedInfo:
     """
     Atomic operations on reserved_info (uint64_t with packed index/size).
 
-    As of slick_queue v1.2.0, reserved_info is a packed uint64_t:
+    As of slick-queue v1.2.0, reserved_info is a packed uint64_t:
     - Bits 0-15: size (16-bit, max 65535)
     - Bits 16-63: index (48-bit, max 281 trillion)
 

@@ -1,7 +1,7 @@
 /*
  * Python C++ extension for cross-platform atomic operations
  *
- * As of slick_queue v1.2.0+, reserved_info is a packed uint64_t (not a struct):
+ * As of slick-queue v1.2.0+, reserved_info is a packed uint64_t (not a struct):
  * - Bits 0-15: size (16-bit)
  * - Bits 16-63: index (48-bit)
  *
