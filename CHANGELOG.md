@@ -42,6 +42,7 @@
 
 ### Fixed
 - `read_last()` now returns actual slot size instead of always returning full `element_size`
+- Test queue names shortened to comply with macOS 31-character shared memory name limit
 
 ### Performance
 - O(1) `read_last()` via direct atomic load (improved from reserved_info calculation)

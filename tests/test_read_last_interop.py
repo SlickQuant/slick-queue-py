@@ -50,7 +50,8 @@ def test_python_publish_cpp_read_last():
     print("TEST: Python Publisher -> C++ read_last()")
     print("=" * 70)
 
-    queue_name = f"test_read_last_py_cpp_{os.getpid()}"
+    # Use shorter name for macOS 31-char limit
+    queue_name = f"rl_py_cpp_{os.getpid()}"
 
     try:
         # Python creates queue and publishes data
@@ -124,7 +125,8 @@ def test_cpp_publish_python_read_last():
     print("TEST: C++ Publisher -> Python read_last()")
     print("=" * 70)
 
-    queue_name = f"test_read_last_cpp_py_{os.getpid()}"
+    # Use shorter name for macOS 31-char limit
+    queue_name = f"rl_cpp_py_{os.getpid()}"
 
     try:
         # Python creates queue first
@@ -203,7 +205,8 @@ def test_read_last_concurrent_publishing():
     print("TEST: Concurrent Publishing -> read_last()")
     print("=" * 70)
 
-    queue_name = f"test_read_last_concurrent_{os.getpid()}"
+    # Use shorter name for macOS 31-char limit
+    queue_name = f"rl_conc_{os.getpid()}"
 
     try:
         # Python creates queue
@@ -294,7 +297,8 @@ def test_read_last_format_compatibility():
         K_INVALID_INDEX
     )
 
-    queue_name = f"test_read_last_format_{os.getpid()}"
+    # Use shorter name for macOS 31-char limit
+    queue_name = f"rl_fmt_{os.getpid()}"
 
     try:
         # Create queue with Python (modern format)
@@ -374,7 +378,8 @@ def test_read_last_multi_slot():
     print("TEST: read_last() with Multi-Slot Publishes")
     print("=" * 70)
 
-    queue_name = f"test_read_last_multisize_{os.getpid()}"
+    # Use shorter name for macOS 31-char limit
+    queue_name = f"rl_multi_{os.getpid()}"
 
     try:
         q = SlickQueue(name=queue_name, size=128, element_size=32)
