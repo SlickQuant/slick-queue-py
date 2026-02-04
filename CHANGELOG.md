@@ -1,6 +1,6 @@
 # Changelogs
 
-## [unreleased]
+## [v1.1.0] - 2026-02-04
 
 ### Breaking Changes
 - **BREAKING:** `read_last()` return signature changed from `Optional[bytes]` to `Tuple[Optional[bytes], int]`
