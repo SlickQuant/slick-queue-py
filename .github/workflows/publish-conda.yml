@@ -5,12 +5,14 @@ on:
 
 jobs:
   build-conda:
+    if: false  # Disabled: workflow doesn't work yet
     name: Build Conda Package
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-15-intel]  # Intel runner for conda compatibility
-        python-version: ['3.8', '3.9', '3.10', '3.11', '3.12']
+        os: [ubuntu-latest]  # Intel runner for conda compatibility
+        python-version: ['3.11']
+        # python-version: ['3.8', '3.9', '3.10', '3.11', '3.12']
         # Note: Excluded Python 3.13+ due to conda-build virtual package resolution issues
         # Note: Using macos-15-intel (x86_64) for consistency with conda-forge practices
 
@@ -21,61 +23,69 @@ jobs:
       uses: conda-incubator/setup-miniconda@v3
       with:
         python-version: ${{ matrix.python-version }}
+        auto-update-conda: false
+        auto-activate-base: false
+        show-channel-urls: true
         channels: conda-forge
         channel-priority: strict
         activate-environment: build-env
 
-    - name: Install conda-build and anaconda-client
-      shell: bash -l {0}
-      run: |
-        # Use classic solver to avoid libmamba compatibility issues
-        conda config --set solver classic
-        conda install -y conda-build anaconda-client
+    # - name: Install conda-build and anaconda-client
+    #   shell: bash -l {0}
+    #   run: |
+    #     # Use classic solver to avoid libmamba compatibility issues
+    #     conda config --set solver classic
+    #     conda install -y conda-build anaconda-client
 
     - name: Build conda package
-      shell: bash -l {0}
-      run: |
-        conda build conda.recipe --output-folder ./conda-bld
-
-    - name: Upload build artifacts
-      uses: actions/upload-artifact@v4
+      uses: uibcdf/action-build-and-upload-conda-packages@v2.0.0
       with:
-        name: conda-package-${{ matrix.os }}-py${{ matrix.python-version }}
-        path: ./conda-bld/**/*.tar.bz2
-        retention-days: 7
+          meta_yaml_dir: conda.recipe/meta.yaml # Replace with the path to your meta.yaml directory
+          user: kzhao77
+          token: ${{ secrets.ANACONDA_API_TOKEN }} # Replace with the name of your Anaconda Token secret
+      # shell: bash -l {0}
+      # run: |
+      #   conda build conda.recipe --output-folder ./conda-bld
 
-  publish-conda:
-    name: Publish to Anaconda Cloud
-    needs: build-conda
-    runs-on: ubuntu-latest
-    if: github.event_name == 'release' && github.event.action == 'published'
+    # - name: Upload build artifacts
+    #   uses: actions/upload-artifact@v4
+    #   with:
+    #     name: conda-package-${{ matrix.os }}-py${{ matrix.python-version }}
+    #     path: ./conda-bld/**/*.tar.bz2
+    #     retention-days: 7
 
-    steps:
-    - name: Set up Conda
-      uses: conda-incubator/setup-miniconda@v3
-      with:
-        python-version: '3.11'
-        channels: conda-forge
+  # publish-conda:
+  #   name: Publish to Anaconda Cloud
+  #   needs: build-conda
+  #   runs-on: ubuntu-latest
+  #   if: github.event_name == 'release' && github.event.action == 'published'
 
-    - name: Install anaconda-client
-      shell: bash -l {0}
-      run: |
-        conda install -y anaconda-client
+  #   steps:
+  #   - name: Set up Conda
+  #     uses: conda-incubator/setup-miniconda@v3
+  #     with:
+  #       python-version: '3.11'
+  #       channels: conda-forge
 
-    - name: Download all artifacts
-      uses: actions/download-artifact@v4
-      with:
-        pattern: conda-package-*
-        merge-multiple: true
-        path: ./conda-packages
+  #   - name: Install anaconda-client
+  #     shell: bash -l {0}
+  #     run: |
+  #       conda install -y anaconda-client
 
-    - name: Upload to Anaconda Cloud
-      shell: bash -l {0}
-      env:
-        ANACONDA_API_TOKEN: ${{ secrets.ANACONDA_API_TOKEN }}
-      run: |
-        # Login using token
-        anaconda -t $ANACONDA_API_TOKEN upload ./conda-packages/**/*.tar.bz2 --force --label main
+  #   - name: Download all artifacts
+  #     uses: actions/download-artifact@v4
+  #     with:
+  #       pattern: conda-package-*
+  #       merge-multiple: true
+  #       path: ./conda-packages
+
+  #   - name: Upload to Anaconda Cloud
+  #     shell: bash -l {0}
+  #     env:
+  #       ANACONDA_API_TOKEN: ${{ secrets.ANACONDA_API_TOKEN }}
+  #     run: |
+  #       # Login using token
+  #       anaconda -t $ANACONDA_API_TOKEN upload ./conda-packages/**/*.tar.bz2 --force --label main
 
     - name: Summary
       shell: bash -l {0}
@@ -84,5 +94,5 @@ jobs:
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "Users can install with:" >> $GITHUB_STEP_SUMMARY
         echo '```bash' >> $GITHUB_STEP_SUMMARY
-        echo "conda install -c ${{ github.repository_owner }} slick_queue_py" >> $GITHUB_STEP_SUMMARY
+        echo "conda install -c ${{ github.repository_owner }} slick-queue-py" >> $GITHUB_STEP_SUMMARY
         echo '```' >> $GITHUB_STEP_SUMMARY
