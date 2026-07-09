@@ -1,5 +1,22 @@
 # Changelogs
 
+## [v1.2.0] - 2026-07-09
+
+### Added
+- `loss_count()`: per-instance count of items skipped due to overwrite, matching
+  C++ slick-queue v1.5.0 (queue.h:230-236). Counted in both the single-consumer
+  read (slot overwritten by a newer generation at the same position) and the
+  AtomicCursor work-stealing read (overrun attributed to the claiming consumer).
+  Cleared by `reset()`. Note: Python always counts; C++ counts only when
+  `SLICK_QUEUE_ENABLE_LOSS_DETECTION` is enabled (debug builds by default).
+- `initial_reading_index()`: cursor for a late-joining consumer - 0 for a newly
+  created queue, or the current writing index of an opened queue, matching C++
+  slick-queue v1.5.0 (queue.h:242-244).
+- `tests/test_loss_count.py`: 7 tests covering both new methods.
+
+These are per-instance API additions only - the shared memory layout is unchanged
+and remains fully compatible with C++ slick-queue v1.x ('SLQ1' format).
+
 ## [v1.1.0] - 2026-02-04
 
 ### Breaking Changes

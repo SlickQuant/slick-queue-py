@@ -20,7 +20,7 @@ Supported on Python 3.8+ (uses multiprocessing.shared_memory).
 """
 from __future__ import annotations
 
-__version__ = '1.1.0'
+__version__ = '1.2.0'
 
 import struct
 import sys
@@ -104,6 +104,8 @@ class SlickQueue:
         self._own = False
         self._last_published_valid = False
         self._atomic_last_published = None
+        # per-instance loss counter (matches C++ queue.h:98 loss_count_; local, not shared)
+        self._loss_count = 0
 
         # Validate parameters
         if size is not None:
@@ -529,6 +531,12 @@ class SlickQueue:
                 read_index = 0
                 continue
 
+            # Loss detection (C++ queue.h:357-361): the slot holds a newer
+            # generation at the same position - the items in between were
+            # overwritten before this consumer read them
+            if data_index != (2**64 - 1) and data_index > read_index and ((data_index & self.mask) == idx):
+                self._loss_count += data_index - read_index
+
             # Check if data is ready (C++ lines 258-261)
             if data_index == (2**64 - 1) or data_index < read_index:
                 return None, 0, read_index
@@ -583,6 +591,12 @@ class SlickQueue:
             if data_index == (2**64 - 1) or data_index < current_index:
                 return None, 0, -1
 
+            # Loss detection (C++ queue.h:406-411): the slot holds a newer
+            # generation at the same position; count only if we claim it below
+            overrun = 0
+            if data_index > current_index and ((data_index & self.mask) == idx):
+                overrun = data_index - current_index
+
             # Check for wrap (C++ lines 300-304)
             if data_index > current_index and ((data_index & self.mask) != idx):
                 # Try to atomically update cursor to skip wrapped slots
@@ -595,11 +609,41 @@ class SlickQueue:
 
             if success:
                 # Successfully claimed the item, read and return it
+                # (loss attributed to the claiming consumer, C++ queue.h:422-426)
+                if overrun != 0:
+                    self._loss_count += overrun
                 data_off = self._data_offset + (current_index & self.mask) * self.element_size
                 data = bytes(self._buf[data_off: data_off + slot_size * self.element_size])
                 return data, slot_size, current_index
 
             # CAS failed, another consumer claimed it, retry
+
+    def loss_count(self) -> int:
+        """
+        Get the number of items skipped due to overwrite observed by this
+        queue instance.
+
+        Matches C++ queue.h:230-236 (added in slick-queue v1.5.0). The counter
+        is per-instance (not shared through the segment). Note: Python always
+        counts; C++ counts only when SLICK_QUEUE_ENABLE_LOSS_DETECTION is
+        enabled (debug builds by default).
+
+        Returns:
+            Count of skipped items observed by this instance.
+        """
+        return self._loss_count
+
+    def initial_reading_index(self) -> int:
+        """
+        Get the initial reading index for a late-joining consumer: 0 if the
+        queue is newly created, or the current writing index if opened existing.
+
+        Matches C++ queue.h:242-244 (added in slick-queue v1.5.0).
+
+        Returns:
+            Initial reading index.
+        """
+        return self._atomic_reserved.load()[0]
 
     def read_last(self) -> Tuple[Optional[bytes], int]:
         """
@@ -654,6 +698,9 @@ class SlickQueue:
         # Reset last_published if modern format (C++ line 473)
         if self._last_published_valid:
             self._atomic_last_published.store_release(K_INVALID_INDEX)
+
+        # Reset loss counter (C++ queue.h:474-476)
+        self._loss_count = 0
 
     def close(self) -> None:
         """Close the queue connection.
