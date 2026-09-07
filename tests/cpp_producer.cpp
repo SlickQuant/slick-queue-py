@@ -14,7 +14,7 @@
 // #endif
 
 #include <limits>
-#include <slick/queue.h>
+#include <slick/queue.hpp>
 #include <iostream>
 #include <cstring>
 #include <cstdint>
@@ -59,7 +59,7 @@ int main(int argc, char* argv[]) {
 
     std::this_thread::sleep_for(std::chrono::milliseconds((int)dist(engine)));
     try {
-        slick::SlickQueue<Element> queue(queue_name);
+        slick::queue<Element> queue(queue_name);
 
         // Produce items
         for (int i = 0; i < num_items; i++) {

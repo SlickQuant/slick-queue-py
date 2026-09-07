@@ -16,7 +16,7 @@
 // #endif
 
 #include <limits>
-#include <slick/queue.h>
+#include <slick/queue.hpp>
 #include <iostream>
 #include <fstream>
 #include <cstring>
@@ -59,7 +59,7 @@ int main(int argc, char* argv[]) {
     // Use array type to match Python's element_size
     using Element = std::array<uint8_t, 32>;
     try {
-        slick::SlickQueue<Element> queue(queue_name);
+        slick::queue<Element> queue(queue_name);
 
         std::cout << "Queue opened successfully!\n";
         std::cout << "  Queue size: " << queue.size() << "\n";

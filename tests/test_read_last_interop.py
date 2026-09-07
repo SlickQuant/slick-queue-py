@@ -342,9 +342,9 @@ def test_read_last_format_compatibility():
         # Open from another instance (simulating C++ opening)
         q2 = SlickQueue(name=queue_name, element_size=32)
 
-        # Verify it detected modern format
-        assert q2._last_published_valid == True, "Should detect modern format"
-        print(f"  Second instance detected modern format: {q2._last_published_valid}")
+        # The attacher validated the segment's layout marker at construction
+        assert q2.traits.enable_read_last is True, "Should maintain last_published"
+        print(f"  Second instance maintains last_published: {q2.traits.enable_read_last}")
 
         # Second instance should also read_last correctly
         data2, size2 = q2.read_last()

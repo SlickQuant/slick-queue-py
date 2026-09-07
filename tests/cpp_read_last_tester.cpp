@@ -12,7 +12,7 @@
  *      - Calls read_last() to verify
  */
 
-#include <slick/queue.h>
+#include <slick/queue.hpp>
 #include <iostream>
 #include <cstring>
 #include <cstdint>
@@ -31,7 +31,7 @@ void print_usage() {
 int read_mode(const char* queue_name, uint32_t element_size) {
     try {
         // Open existing queue
-        slick::SlickQueue<Element> queue(queue_name);
+        slick::queue<Element> queue(queue_name);
 
         std::cout << "C++ opened queue: " << queue_name << std::endl;
         std::cout << "  Queue size: " << queue.size() << std::endl;
@@ -68,7 +68,7 @@ int read_mode(const char* queue_name, uint32_t element_size) {
 int write_mode(const char* queue_name, uint32_t queue_size, uint32_t count, uint32_t element_size) {
     try {
         // Create/open queue
-        slick::SlickQueue<Element> queue(queue_size, queue_name);
+        slick::queue<Element> queue(queue_size, queue_name);
 
         std::cout << "C++ created/opened queue: " << queue_name << std::endl;
         std::cout << "  Queue size: " << queue.size() << std::endl;

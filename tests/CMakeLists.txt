@@ -123,6 +123,30 @@ add_test(
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 )
 
+add_test(
+    NAME loss_count_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/test_loss_count.py
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+)
+
+add_test(
+    NAME traits_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/test_traits.py
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+)
+
+add_test(
+    NAME reset_detection_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/test_reset_detection.py
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+)
+
+add_test(
+    NAME wrap_invariants_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/test_wrap_invariants.py
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+)
+
 # Set timeouts for all tests to prevent CI hangs
 set_tests_properties(
     atomic_ops_test
@@ -136,5 +160,9 @@ set_tests_properties(
     read_last_test
     read_last_interop_test
     modern_format_test
+    loss_count_test
+    traits_test
+    reset_detection_test
+    wrap_invariants_test
     PROPERTIES TIMEOUT 120
 )

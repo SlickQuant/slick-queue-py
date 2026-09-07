@@ -15,8 +15,8 @@ def test_modern_format_header():
 
     q = SlickQueue(size=16, element_size=64)
 
-    # Verify it's using modern format
-    assert q._last_published_valid == True, "Queue should be in modern format"
+    # Verify it maintains the last-published index
+    assert q.traits.enable_read_last is True, "Queue should maintain last_published"
     assert q._atomic_last_published is not None, "Should have last_published atomic"
 
     # Check header constants
@@ -102,10 +102,11 @@ def test_memory_layout_matches_cpp():
     print("Testing memory layout compatibility with C++...")
 
     from slick_queue_py import (
-        HEADER_SIZE, SLOT_SIZE,
+        HEADER_SIZE, SLOT_SIZE, SLOT_SIZE_OFFSET,
         SIZE_OFFSET, ELEMENT_SIZE_OFFSET,
         LAST_PUBLISHED_OFFSET, HEADER_MAGIC_OFFSET,
-        INIT_STATE_OFFSET
+        INIT_STATE_OFFSET, HEADER_MAGIC,
+        HEADER_MAGIC_FEATURE_MASK, HEADER_MAGIC_READ_LAST
     )
 
     # Verify offsets match C++ queue.h:107-135
@@ -116,6 +117,13 @@ def test_memory_layout_matches_cpp():
     assert INIT_STATE_OFFSET == 48, "init_state offset should be 48"
     assert HEADER_SIZE == 64, "Header size should be 64 bytes"
     assert SLOT_SIZE == 16, "Slot size should be 16 bytes"
+    assert SLOT_SIZE_OFFSET == 8, "slot.size offset within a slot should be 8"
+
+    # The layout marker is part of the cross-process contract
+    assert HEADER_MAGIC == 0x534C5131, "header magic should be 'SLQ1'"
+    assert HEADER_MAGIC_FEATURE_MASK == 0x0000000F, "feature nibble should be the low 4 bits"
+    assert HEADER_MAGIC_READ_LAST == 0x1, "read_last should be feature bit 0"
+    assert HEADER_MAGIC & ~HEADER_MAGIC_READ_LAST == 0x534C5130, "cleared bit 0 should be 'SLQ0'"
 
     print("[PASS] Memory layout offsets match C++ implementation")
 
@@ -131,7 +139,7 @@ def test_shared_memory_modern_format():
     try:
         # Create queue
         q1 = SlickQueue(name=queue_name, size=8, element_size=32)
-        assert q1._last_published_valid == True, "Creator should use modern format"
+        assert q1.traits.enable_read_last is True, "Creator should maintain last_published"
 
         # Publish some data
         idx = q1.reserve()
@@ -140,7 +148,7 @@ def test_shared_memory_modern_format():
 
         # Open from another "process"
         q2 = SlickQueue(name=queue_name, element_size=32)
-        assert q2._last_published_valid == True, "Opener should detect modern format"
+        assert q2.traits.enable_read_last is True, "Opener should maintain last_published"
 
         # Both should see the same data via read_last
         data1, size1 = q1.read_last()

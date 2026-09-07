@@ -1,5 +1,120 @@
 # Changelogs
 
+## [v2.0.0] - 2026-09-07
+
+Tracks C++ slick-queue v2.0.0. Feature configuration moves to a `traits`
+argument, `enable_read_last` becomes part of the shared-memory contract so a
+mismatched peer is rejected at attach time instead of degrading silently, and
+several read-path correctness bugs are fixed.
+
+### Breaking Changes
+
+- **BREAKING:** `read_last()` requires `traits.enable_read_last` and raises
+  `RuntimeError` otherwise. The legacy reserved-cursor fallback is gone with it;
+  it reported reservations that were never published and truncated sizes above
+  65,535.
+- **BREAKING:** `enable_read_last` is part of the shared-memory contract. The
+  header magic carries a feature nibble - `'SLQ1'` when the last-published index
+  is maintained, `'SLQ0'` when it is not - and every attacher matches it against
+  its own configuration, raising `RuntimeError` on a mismatch in either
+  direction. The other traits stay process-local and mix freely on one segment.
+- **BREAKING:** Segments created before slick-queue v1.4.0 carry no layout marker
+  and are rejected at attach time, rather than served by the reserved-cursor
+  fallback.
+- **BREAKING:** Reset detection is opt-in via `enable_reset_check` (default off),
+  matching C++. `read()` no longer loads the producer's reservation counter on
+  every call.
+- **BREAKING:** `q.traits` is a read-only snapshot, not the class passed in, so
+  `q.traits is MyTraits` is now False and its attributes cannot be assigned.
+- **BREAKING:** The private `_last_published_valid` attribute is gone; use
+  `q.traits.enable_read_last`.
+- `reserve(0)` raises `ValueError` instead of reserving nothing.
+
+### Added
+
+- `QueueTraits`, `default_queue_traits`, `validate_traits()`, and a `traits=`
+  argument on `SlickQueue`. Subclass `QueueTraits` to override
+  `enable_read_last`, `enable_reset_check`, `enable_loss_detection` or
+  `enable_cpu_relax`; differently configured queues coexist in one process.
+  `validate_traits()` rejects a malformed traits type at construction, as the C++
+  `queue_traits_type` concept does, and like it cannot catch a misspelled
+  override.
+- Constants `HEADER_MAGIC_FEATURE_MASK`, `HEADER_MAGIC_READ_LAST` and
+  `SLOT_SIZE_OFFSET`.
+- 40 tests. `tests/test_traits.py` (24) covers traits validation, the marker each
+  configuration writes, both mismatch directions, unmarked and unknown-feature
+  segments, and mutation of a traits class after construction.
+  `tests/test_reset_detection.py` (9) asserts a stale reader actually rewinds
+  onto the new generation, across both read paths and both memory modes.
+  `tests/test_wrap_invariants.py` (7) pins the cursor/size invariant under a
+  wrapping producer; three drive the recycle deterministically, because CPython
+  switches threads far too rarely to hit the window by racing.
+
+### Fixed
+
+- Both `read()` overloads loaded `slot.size` twice, unvalidated, so a producer
+  recycling the slot between the loads left the cursor describing a different
+  record than the caller was handed - in the shared-cursor overload the two loads
+  straddled the claiming CAS. Both now load it once and re-validate the slot
+  before committing, as `read_last()` does.
+- `read_last()` could return a `(data, size)` pair describing two different
+  records; the slot is now validated before and after the size load.
+- Reset detection never fired for the case it exists to handle. It compared the
+  *slot's* index against the reservation counter, but `reset()` clears the
+  control array before rewinding the counter, so a stale reader always landed on
+  a slot holding an invalid or fresh-low index - neither ahead of the counter.
+  The test is now on the reader's cursor, shared by both read paths through
+  `_was_reset()`.
+- The reset branch in the shared-cursor `read()` overwrote the cursor with a
+  blind store, discarding other consumers' progress; it now rewinds via
+  compare-exchange.
+- The single-consumer `read()` charged the loss counter when the overrun was
+  spotted rather than on commit, so a retry could count the same overrun twice.
+- `reset()` did not rewind the reservation counter in local memory mode.
+- Traits were re-read from the caller's class on every `publish()` and `read()`,
+  while the layout marker and the optional atomics were created once. Mutating
+  the class afterwards froze `read_last()` on an `'SLQ1'` segment, or raised
+  `AttributeError` from `publish()` and `reset()` because the last-published
+  atomic had never been created. They are snapshotted at construction now.
+
+### Changed
+
+- Loss detection is gated on `enable_loss_detection`, on by default. C++ keys its
+  equivalent off `NDEBUG` and needs two traits types so a debug/release mismatch
+  fails to link instead of violating the ODR; Python has no translation units to
+  protect, and `__debug__` was rejected because it would zero `loss_count()`
+  under `python -O`. It costs +0.2% on a reader that keeps up.
+- `publish()` updates the last-published index unconditionally when the feature
+  is on - validating the nibble once at attach time makes the old per-call
+  `_last_published_valid` check redundant.
+- Contended CAS loops in `reserve()` and the shared-cursor `read()` back off
+  through `_cpu_relax()`, gated on `enable_cpu_relax`.
+- C++ interop programs include the renamed `<slick/queue.hpp>` and use the
+  `slick::queue` alias; the old `<slick/queue.h>` path is a deprecation shim.
+- `tests/CMakeLists.txt` registers `test_loss_count.py` (missed in v1.2.0) and
+  the three new files. `tests/test_interop.py` bounds each child-result `get()`,
+  which previously hung a run forever when a child was killed on a join timeout.
+
+### Notes
+
+`slot.size` became a `std::atomic<uint32_t>` in C++ but stays a plain struct
+field here: that change fixed C++ undefined behaviour and compiler re-loading,
+neither of which exists in CPython, and the field is already an aligned 4-byte
+access with an identical wire format.
+
+The seqlock validation guarantees the cursor and the returned size describe one
+and the same record. It does **not** make the returned bytes a snapshot: a
+producer writes an element's data before it publishes the slot's new index, so a
+lapped consumer can copy bytes mid-overwrite and no check on the slot can detect
+it. C++ has the identical hazard behind the pointer it returns; `loss_count()` is
+how a consumer detects it. See README.md and API_DIFFERENCES.md.
+
+### Compatibility
+
+Verified against C++ slick-queue v2.0.0 binaries: all 10 interop tests pass, and
+a Python-created `'SLQ0'` segment is rejected by a C++ peer built with
+`enable_read_last` on, with the message the C++ side raises.
+
 ## [v1.2.0] - 2026-07-09
 
 ### Added

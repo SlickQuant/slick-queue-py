@@ -12,12 +12,29 @@ import sys
 import time
 from multiprocessing import Process, Queue as MPQueue
 from pathlib import Path
+from queue import Empty
 import random
 
 # Add parent directory to path to import slick_queue_py
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from slick_queue_py import SlickQueue
+
+
+def get_result(results_queue, what, timeout=15):
+    """Read one result, bounded.
+
+    A child that was killed - or that died before reaching its own except
+    handler - never queues anything, so an unbounded get() here turns a slow or
+    stuck child into a test run that hangs forever rather than failing.
+    """
+    try:
+        return results_queue.get(timeout=timeout)
+    except Empty:
+        raise AssertionError(
+            f"{what} produced no result within {timeout}s; it was killed or died "
+            f"before reporting"
+        )
 
 
 def find_cpp_executable(name):
@@ -135,14 +152,14 @@ def test_python_producer_cpp_consumer():
             results = MPQueue()
             producer = Process(target=python_producer, args=(queue_name, num_items, 1, results, size))
             producer.start()
-            producer.join(timeout=10)
+            producer.join(timeout=30)
 
             if producer.is_alive():
                 producer.kill()
                 raise RuntimeError("Python producer timeout")
 
             # Check producer result
-            result = results.get()
+            result = get_result(results, "Python producer")
             assert result[0] == 'success', f"Producer failed: {result}"
 
             # Debug: On Linux, verify shared memory exists before calling C++
@@ -256,13 +273,13 @@ def test_cpp_producer_python_consumer():
             raise RuntimeError(f"C++ producer failed with code {proc.returncode}")
 
         # Wait for consumer
-        consumer.join(timeout=10)
+        consumer.join(timeout=30)
         if consumer.is_alive():
             consumer.kill()
             raise RuntimeError("Python consumer timeout")
 
         # Check consumer result
-        result = results.get()
+        result = get_result(results, "Python consumer")
         assert result[0] == 'success', f"Consumer failed: {result}"
         consumed = result[1]
 
@@ -346,15 +363,21 @@ def test_multi_producer_interop():
             p.start()
             python_producers.append(p)
 
-        # Wait for Python producers
-        for p in python_producers:
-            p.join(timeout=10)
+        # Wait for Python producers. The timeout has to cover process spawn, which
+        # on Windows re-imports this module in each child and can be slow when the
+        # machine is loaded - the producers themselves only do ~150ms of work.
+        killed = []
+        for i, p in enumerate(python_producers):
+            p.join(timeout=30)
             if p.is_alive():
                 p.kill()
+                killed.append(i)
+
+        assert not killed, f"Python producer(s) {killed} timed out and were killed"
 
         # Check Python producer results
         for _ in range(num_python_procs):
-            result = python_producers_results.get()
+            result = get_result(python_producers_results, "Python producer")
             assert result[0] == 'success', f"Python producer failed: {result}"
 
         # Wait for C++ producers
@@ -365,13 +388,13 @@ def test_multi_producer_interop():
             raise RuntimeError(f"C++ multi-producer failed with code {cpp_proc.returncode}")
 
         # Wait for consumer
-        consumer.join(timeout=15)
+        consumer.join(timeout=30)
         if consumer.is_alive():
             consumer.kill()
             raise RuntimeError("Consumer timeout")
 
         # Check consumer result
-        result = results.get()
+        result = get_result(results, "Python consumer")
         assert result[0] == 'success', f"Consumer failed: {result}"
         consumed = result[1]
 

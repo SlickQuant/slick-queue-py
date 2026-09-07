@@ -5,7 +5,7 @@
  */
 
 #include <limits>
-#include <slick/queue.h>
+#include <slick/queue.hpp>
 #include <iostream>
 #include <fstream>
 #include <cstring>
@@ -51,7 +51,7 @@ int main(int argc, char* argv[]) {
     // Use array type to match Python's element_size
     using Element = std::array<uint8_t, 32>;
     try {
-        slick::SlickQueue<Element> queue(queue_name);
+        slick::queue<Element> queue(queue_name);
 
         std::atomic<uint64_t>* atomic_cursor;
         slick::shm::shared_memory shm(cursor_name, sizeof(std::atomic<uint64_t>), slick::shm::create_only, slick::shm::access_mode::read_write, std::nothrow);

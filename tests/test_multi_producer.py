@@ -665,6 +665,15 @@ def test_wrap_around():
             for item in produced:
                 all_produced.add((item[0], item[1]))
 
+        # A consumer whose result did not arrive before the collector timed out
+        # leaves this list empty; say so rather than raising IndexError from the
+        # subscript below, which says nothing about what actually went wrong.
+        assert consumer_results, (
+            f"the consumer produced no result before the collector timed out "
+            f"(got {len(all_results)} of {num_producers + 1} results: "
+            f"{[r[0] for r in all_results]})"
+        )
+
         # Extract only worker_id and item_num to match produced format
         consumed = set()
         # print(f'consumer_results: {len(consumer_results[0][2])}')

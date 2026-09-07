@@ -16,7 +16,9 @@ This is the Python binding for the [SlickQueue C++ library](https://github.com/S
 - **Lock-Free Multi-Producer Multi-Consumer**: True MPMC support using atomic operations
 - **C++/Python Interoperability**: Python and C++ processes can share the same queue
 - **Cross-Platform**: Windows and Linux/macOS support (x86-64)
-- **Memory Layout Compatible**: Exact binary compatibility with C++ `slick::SlickQueue<T>`
+- **Memory Layout Compatible**: Exact binary compatibility with C++ `slick::queue<T>`
+- **Configurable Features**: Optional behaviour is selected per queue through
+  [traits](#configuring-features-traits), so a feature you do not need costs nothing
 - **High Performance**: Hardware atomic operations for minimal overhead
 
 ## Requirements
@@ -243,7 +245,7 @@ q.unlink()
 
 The Python implementation is fully compatible with the C++ [SlickQueue](https://github.com/SlickQuant/slick-queue) library. Python and C++ processes can produce and consume from the same queue with:
 
-- **Exact memory layout compatibility**: Binary-compatible with `slick::SlickQueue<T>`
+- **Exact memory layout compatibility**: Binary-compatible with `slick::queue<T>`
 - **Atomic operation compatibility**: Same 16-byte and 8-byte CAS semantics
 - **Bidirectional communication**: C++ ↔ Python in both directions
 - **Multi-producer support**: Mix C++ and Python producers on the same queue
@@ -257,11 +259,11 @@ The Python implementation is fully compatible with the C++ [SlickQueue](https://
 
 **C++ Producer:**
 ```cpp
-#include "queue.h"
+#include <slick/queue.hpp>
 
 int main() {
     // Open existing queue created by Python
-    slick::SlickQueue<uint8_t> q(32, "shared_queue");
+    slick::queue<uint8_t> q(32, "shared_queue");
 
     for (int i = 0; i < 100; i++) {
         auto idx = q.reserve();
@@ -324,7 +326,7 @@ See [tests/test_interop.py](tests/test_interop.py) and [tests/cpp_*.cpp](tests/)
 
 ### SlickQueue
 
-#### `__init__(*, name=None, size=None, element_size=None)`
+#### `__init__(*, name=None, size=None, element_size=None, traits=None)`
 
 Create a queue in local memory or shared memory mode.
 
@@ -332,6 +334,15 @@ Create a queue in local memory or shared memory mode.
 - `name` (str, optional): Shared memory segment name. If None, uses local memory mode (single process).
 - `size` (int): Queue capacity (must be power of 2). Required for local mode or when creating shared memory.
 - `element_size` (int, required): Size of each element in bytes
+- `traits` (type, optional): Feature configuration, a `QueueTraits` subclass. Defaults to
+  `default_queue_traits`. See [Configuring Features (Traits)](#configuring-features-traits).
+
+**Raises:**
+- `ValueError`: If `size` is not a power of two
+- `TypeError`: If `traits` is missing a trait or declares one as something other than a `bool`
+- `RuntimeError`: If an existing segment disagrees about the layout marker - it carries none
+  (created before slick-queue v1.4.0), was created with unknown layout features, or disagrees
+  about `enable_read_last`
 
 **Examples:**
 ```python
@@ -343,6 +354,12 @@ q = SlickQueue(name='my_queue', size=256, element_size=64)
 
 # Open existing shared memory queue
 q2 = SlickQueue(name='my_queue', element_size=64)
+
+# Opt out of read_last() tracking to drop its CAS from publish()
+class Lean(QueueTraits):
+    enable_read_last = False
+
+q3 = SlickQueue(size=256, element_size=64, traits=Lean)
 ```
 
 #### `reserve(n=1) -> int`
@@ -455,12 +472,19 @@ while True:
 
 #### `read_last() -> Tuple[Optional[bytes], int]`
 
-Read the most recently published item.
+Read the most recently published item. Requires `traits.enable_read_last`.
 
 **Returns:**
 - `Tuple[Optional[bytes], int]`: Tuple of (data, size)
-  - `data`: Last published data or None if queue is empty
-  - `size`: Number of slots the item occupies (0 if queue is empty)
+  - `data`: Last published data, or None if the queue is empty or the slot was recycled
+    by a wrapping producer while it was being read
+  - `size`: Number of slots the item occupies (0 if no data is returned)
+
+**Raises:**
+- `RuntimeError`: If `traits.enable_read_last` is False. There is no fallback: without the
+  feature nothing maintains the last published index, and the reserved cursor is not a
+  substitute because it reports reservations that were never published and truncates sizes
+  above 65,535.
 
 **Example:**
 ```python
@@ -468,6 +492,23 @@ data, size = q.read_last()
 if data is not None:
     print(f"Last item: {data[:size * element_size]}")
 ```
+
+#### `loss_count() -> int`
+
+Number of items this instance skipped because a producer overran it. Requires
+`traits.enable_loss_detection`, which is on by default; returns 0 when it is off. The counter is per-instance, not
+shared through the segment, and is cleared by `reset()`.
+
+#### `initial_reading_index() -> int`
+
+Cursor for a late-joining consumer: 0 for a newly created queue, or the current writing
+index of a queue that was opened. Starting a reader here skips the backlog.
+
+#### `reset()`
+
+Clear the queue and rewind it to its initial state. Not thread-safe: call it only when no
+other thread or process is touching the queue. Readers holding a pre-`reset()` cursor
+recover only if they were built with `enable_reset_check`.
 
 #### `__getitem__(index) -> memoryview`
 
@@ -549,26 +590,101 @@ Atomically compare and swap the cursor value.
 
 **Note:** This is used internally by `read(atomic_cursor)` and typically doesn't need to be called directly.
 
+## Configuring Features (Traits)
+
+Optional features are selected per queue through a `traits` argument, mirroring the
+`Traits` template parameter of C++ `slick::queue<T, Traits>`. Subclass `QueueTraits` and
+override only what you need:
+
+```python
+from slick_queue_py import SlickQueue, QueueTraits
+
+class MyTraits(QueueTraits):
+    enable_reset_check = True   # opt in
+    enable_read_last = False    # opt out
+
+lean = SlickQueue(size=1024, element_size=8, traits=MyTraits)
+standard = SlickQueue(size=1024, element_size=8)   # default traits - both can coexist
+```
+
+| Trait | Default | Effect when enabled |
+| --- | --- | --- |
+| `enable_read_last` | `True` | `publish()` maintains a last-published index so `read_last()` works. Costs one CAS per publish. |
+| `enable_reset_check` | `False` | `read()` loads the producer's reservation counter and rewinds the cursor to 0 if it has run past it, which happens only when `reset()` rewound the counter. Without this, a reader holding a pre-`reset()` cursor returns `None` indefinitely and then skips the start of the new generation. |
+| `enable_loss_detection` | `True` | Per-instance skipped-item counter, reported by `loss_count()`. |
+| `enable_cpu_relax` | `True` | Yield-based backoff on contended CAS loops. |
+
+There is one traits type and one default. C++ needs two (`queue_traits` and
+`debug_queue_traits`, selected by `NDEBUG`) so that a debug/release mismatch across
+translation units fails to link instead of silently violating the ODR - Python has no
+translation units, no ODR and no linker, and no debug/release build to key them off.
+
+**Loss detection is on by default here, unlike the C++ Release default.** C++ pays a
+cacheline and an atomic `fetch_add` for it; in Python it measures at +0.2% on a reader that
+keeps up, and `loss_count()` is the only signal a consumer has that it was overrun - which
+also makes it the only way to know the bytes `read()` returned may have been overwritten in
+flight. `__debug__` would have been the obvious analogue of `NDEBUG`, but it is about
+stripping asserts, and keying the counter to it would make `loss_count()` silently return 0
+under `python -O` - hiding exactly the condition it exists to report. Subclass
+`QueueTraits` with `enable_loss_detection = False` for maximum throughput.
+
+Notes:
+
+- **`read_last()` requires `enable_read_last`.** Calling it otherwise raises `RuntimeError`,
+  not a silent fallback to the old reserved-cursor heuristic.
+- **`enable_read_last` must match across a shared-memory segment.** It is the one trait that
+  changes the shared header protocol, so the creator records it in the segment's layout
+  marker (`'SLQ1'` when the last-published index is maintained, `'SLQ0'` when it is not) and
+  every attacher checks it - including C++ peers, which use the same marker. A peer that
+  disagrees is rejected with a `RuntimeError` at construction instead of silently corrupting
+  the other side's view, in either direction: an attacher that expects the index would read a
+  counter nobody writes, and one that does not maintain it would freeze `read_last()` for
+  every peer that does. The other traits are local to each process and can differ freely on
+  one segment.
+- **A misspelled override is silent.** `enable_reset_chek = True` in a subclass leaves the
+  inherited attribute visible and keeps the base value. `validate_traits()` catches a wrong
+  *type*, but cannot catch a typo.
+- **Traits are snapshotted at construction.** A traits type is an ordinary class, so its
+  attributes stay writable, but the queue commits to the configuration once - it writes the
+  layout marker from it and creates the optional atomics from it. Mutating the class
+  afterwards therefore has no effect on queues already built from it, and `q.traits` is a
+  read-only snapshot that always describes what that queue actually does. Build a new queue
+  to change a setting.
+
 ## Memory Layout
 
-The queue uses the same memory layout as C++ `slick::SlickQueue<T>`:
+The queue uses the same memory layout as C++ `slick::queue<T>`:
 
 ```
 Offset | Size          | Content
 -------|---------------|------------------
-0      | 16 bytes      | reserved_info (atomic)
-       |   0-7         |   uint64_t index_
-       |   8-11        |   uint32_t size_
-       |   12-15       |   padding
-16     | 4 bytes       | uint32_t size_ (queue capacity)
-20     | 44 bytes      | padding (to 64 bytes)
+0      | 8 bytes       | reserved_info (atomic uint64: 48-bit index, 16-bit size)
+8      | 4 bytes       | uint32_t size (queue capacity)
+12     | 4 bytes       | uint32_t element_size
+16     | 8 bytes       | uint64_t last_published index (atomic)
+24     | 4 bytes       | uint32_t header_magic - 'SLQ' + feature nibble
+28     | 20 bytes      | padding (reserved)
+48     | 4 bytes       | uint32_t init_state (atomic)
+52     | 12 bytes      | padding (to 64 bytes)
 64     | 16*size bytes | slot array
        | per slot:     |
        |   0-7         |   uint64_t data_index (atomic)
-       |   8-11        |   uint32_t size
+       |   8-11        |   uint32_t size (atomic)
        |   12-15       |   padding
 64+... | elem*size     | data array
 ```
+
+The header magic is the bytes `'SLQ'` followed by an ASCII digit whose low nibble carries the
+shared-layout features the creator was built with:
+
+| Marker | Value | Meaning |
+| --- | --- | --- |
+| `'SLQ1'` | `0x534C5131` | The last-published index at offset 16 is maintained |
+| `'SLQ0'` | `0x534C5130` | It is not - `read_last()` is unavailable to every peer |
+
+Bits 1-3 of the nibble are reserved and must be 0; a marker that sets one is rejected as
+newer than this build understands. Segments created before slick-queue v1.4.0 carry no
+marker at all and are rejected at attach time.
 
 ## Platform Support
 
@@ -700,6 +816,21 @@ python tests/test_local_mode.py
 # Note: If tests fail with "File exists" errors, run cleanup first:
 python tests/cleanup_shm.py
 python tests/test_multi_producer.py
+
+# Traits, layout marker, and cross-peer feature mismatch
+python tests/test_traits.py
+
+# reset() recovery (enable_reset_check)
+python tests/test_reset_detection.py
+
+# Wrapping-producer record/size invariants
+python tests/test_wrap_invariants.py
+```
+
+Or run everything with pytest:
+
+```bash
+python -m pytest tests/
 ```
 
 ### C++/Python Interoperability Tests
@@ -752,13 +883,26 @@ The queue uses platform-specific atomic operations:
 ### Memory Ordering
 
 - `reserve()`: Uses `memory_order_release` on successful CAS
-- `publish()`: Uses `memory_order_release` for data_index store
-- `read()`: Uses `memory_order_acquire` for data_index load
+- `publish()`: Writes `slot.size`, then stores `data_index` with `memory_order_release`
+- `read()` / `read_last()`: Load `data_index` with `memory_order_acquire`, read
+  `slot.size` once, then re-validate `data_index` before using either
 
 This ensures:
 - All writes to data are visible before publishing
 - All reads of data happen after acquiring the index
+- The returned `(data, size)` pair always describes one and the same record, even
+  when a wrapping producer recycles the slot mid-read - the re-validation is a
+  seqlock bracket around the size load, and a reader that loses the race retries
+  rather than returning a torn pair
 - No reordering that could cause data races
+
+**What is not guaranteed:** the queue is lossy. A producer writes an element's data
+*before* it publishes the slot's new index, so a consumer that has been lapped can
+copy bytes the producer is midway through overwriting - nothing in the slot can
+detect this, because the index has not changed yet. C++ has the identical hazard and
+hands back a pointer whose target is the producer's to overwrite; Python copies, so
+the copy can hold a newer record's bytes under the older record's cursor. Size the
+queue so consumers keep up, and use `loss_count()` to detect when they have not.
 
 ## Comparison with C++
 
@@ -772,6 +916,8 @@ This ensures:
 | Ease of use | Medium | High |
 | read(int) single-consumer | ✅ | ✅ |
 | read(atomic cursor) multi-consumer | ✅ | ✅ |
+| Feature traits | Template parameter | `traits=` argument |
+| Shared layout marker | `'SLQ1'` / `'SLQ0'` | Same, and validated against C++ peers |
 
 ## Contributing
 

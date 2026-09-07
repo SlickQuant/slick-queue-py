@@ -14,7 +14,7 @@
 // #endif
 
 #include <limits>
-#include <slick/queue.h>
+#include <slick/queue.hpp>
 #include <iostream>
 #include <cstring>
 #include <cstdint>
@@ -32,7 +32,7 @@ void producer_thread(const char* queue_name, int worker_id, int num_items, int s
         // Open existing queue (created by Python)
         // Use array type to match Python's element_size
         using Element = std::array<uint8_t, 32>;
-        slick::SlickQueue<Element> queue(size, queue_name);
+        slick::queue<Element> queue(size, queue_name);
 
         while (!fs::exists("ready")) {
             // wait for consumer to be ready
