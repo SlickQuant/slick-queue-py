@@ -513,9 +513,9 @@ def test_attach_rejects_segment_without_marker():
 
 def test_attach_rejects_unknown_feature_bits():
     """A marker carrying a feature bit this build does not know about is rejected
-    rather than guessed at."""
+    rather than guessed at. Bit 2 - bit 1 now means items_per_slot != 1."""
     name = _unique("slq_tr_unknown")
-    shm = _make_raw_segment(name, 8, 8, magic=HEADER_MAGIC | 0x2)  # 'SLQ3'
+    shm = _make_raw_segment(name, 8, 8, magic=HEADER_MAGIC | 0x4)  # 'SLQ5'
     try:
         try:
             SlickQueue(name=name, element_size=8)

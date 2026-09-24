@@ -336,9 +336,14 @@ Create a queue in local memory or shared memory mode.
 - `element_size` (int, required): Size of each element in bytes
 - `traits` (type, optional): Feature configuration, a `QueueTraits` subclass. Defaults to
   `default_queue_traits`. See [Configuring Features (Traits)](#configuring-features-traits).
+- `items_per_slot` (int, optional): **The minimum number of elements a single `reserve()`
+  consumes** (power of 2, `<= size`). Defaults to 1 when creating; when opening an existing
+  segment by name it defaults to the segment's value. See
+  [Byte Buffers and items_per_slot](#byte-buffers-and-items_per_slot).
 
 **Raises:**
-- `ValueError`: If `size` is not a power of two
+- `ValueError`: If `size` or `items_per_slot` is not a power of two, `items_per_slot > size`,
+  or an existing segment was created with a different `items_per_slot`
 - `TypeError`: If `traits` is missing a trait or declares one as something other than a `bool`
 - `RuntimeError`: If an existing segment disagrees about the layout marker - it carries none
   (created before slick-queue v1.4.0), was created with unknown layout features, or disagrees
@@ -362,12 +367,49 @@ class Lean(QueueTraits):
 q3 = SlickQueue(size=256, element_size=64, traits=Lean)
 ```
 
+#### Byte Buffers and items_per_slot
+
+Every reservation is tracked by a 16-byte control slot. By default there is one per element,
+which is negligible for large elements but dominates for a byte buffer: a 16M-element queue
+with `element_size=1` needs 16 MB of data and 256 MB of control slots.
+
+Pass `items_per_slot` to fix that. **`items_per_slot` is the minimum number of elements a single
+`reserve()` consumes.** Any `reserve(n)` with `n <= items_per_slot` takes exactly one unit of
+`items_per_slot` elements; a larger one takes `ceil(n / items_per_slot)` units. One control slot
+covers one unit, so the control array shrinks to `size // items_per_slot` slots
+(`q.slot_count`).
+
+```python
+# 16M byte buffer, minimum 64 bytes per reservation:
+# 16 MB data + 4 MB control, instead of 16 MB + 256 MB
+buf = SlickQueue(name='bytes', size=16 << 20, element_size=1, items_per_slot=64)
+
+i = buf.reserve(3)     # consumes 64 elements (the minimum); i is a multiple of 64
+j = buf.reserve(200)   # consumes 256 elements (4 units), still one control slot
+
+data, size, cursor = buf.read(0)   # size is what you published; cursor advances by 64
+```
+
+`read()` returns the size you published while the cursor advances by the whole units the
+reservation consumed. The trade-off is that a message smaller than `items_per_slot` still costs a
+full unit, so the queue holds at most `size // items_per_slot` messages - choose it to match
+your typical message size, not your largest. `publish()` should be given the same `n` as the
+matching `reserve()`.
+
+The value is recorded in the shared-memory header, so it interoperates with C++
+`slick::queue<T>(size, items_per_slot, name)` in both directions: an attacher opened by name
+adopts it, and a creator that opens an existing segment with a different value raises
+`ValueError`. Segments created before this field existed read as `items_per_slot = 1`. A value
+other than 1 also sets bit 1 of the layout marker, so an older peer that cannot understand the
+field refuses the segment instead of misreading it - see [Memory Layout](#memory-layout).
+
 #### `reserve(n=1) -> int`
 
 Reserve `n` elements for writing. **Multi-producer safe** using atomic CAS.
 
 **Parameters:**
-- `n` (int): Number of elements to reserve (default 1)
+- `n` (int): Number of elements to reserve (default 1). Rounded up to a multiple of
+  `items_per_slot`.
 
 **Returns:**
 - `int`: Starting index of reserved space
@@ -663,16 +705,23 @@ Offset | Size          | Content
 12     | 4 bytes       | uint32_t element_size
 16     | 8 bytes       | uint64_t last_published index (atomic)
 24     | 4 bytes       | uint32_t header_magic - 'SLQ' + feature nibble
-28     | 20 bytes      | padding (reserved)
+28     | 4 bytes       | uint32_t items_per_slot (0 reads as 1)
+32     | 16 bytes      | padding (reserved)
 48     | 4 bytes       | uint32_t init_state (atomic)
 52     | 12 bytes      | padding (to 64 bytes)
-64     | 16*size bytes | slot array
+64     | 16*size/items_per_slot bytes | slot array
        | per slot:     |
        |   0-7         |   uint64_t data_index (atomic)
        |   8-11        |   uint32_t size (atomic)
        |   12-15       |   padding
+       | 0+ bytes      | padding - only when items_per_slot != 1, up to the lowest set bit of element_size
 64+... | elem*size     | data array
 ```
+
+When `items_per_slot != 1` the control array can be short enough that the data array would
+start misaligned for the C++ element type (a single slot ends at offset 80), so it is padded to
+the lowest set bit of `element_size` - always a multiple of the C++ `alignof(T)`, and derivable
+from the header on both sides. The default layout is never padded.
 
 The header magic is the bytes `'SLQ'` followed by an ASCII digit whose low nibble carries the
 shared-layout features the creator was built with:
@@ -681,8 +730,18 @@ shared-layout features the creator was built with:
 | --- | --- | --- |
 | `'SLQ1'` | `0x534C5131` | The last-published index at offset 16 is maintained |
 | `'SLQ0'` | `0x534C5130` | It is not - `read_last()` is unavailable to every peer |
+| `'SLQ3'` | `0x534C5133` | As `'SLQ1'`, and `items_per_slot` at offset 28 is not 1 |
+| `'SLQ2'` | `0x534C5132` | As `'SLQ0'`, and `items_per_slot` at offset 28 is not 1 |
 
-Bits 1-3 of the nibble are reserved and must be 0; a marker that sets one is rejected as
+Bit 1 is set exactly when `items_per_slot != 1`. It exists for peers built before
+`items_per_slot` (slick-queue-py and slick-queue 2.0.0 and earlier): they know nothing of offset
+28 and would index the control array one slot per element, but they reject any marker bit they
+do not recognise, so they fail loudly with *"created with unknown layout features"* instead of
+misreading the segment. A default segment keeps `'SLQ1'`/`'SLQ0'` and stays open to them. This
+build also requires bit 1 to agree with the offset-28 field and rejects a segment where it does
+not.
+
+Bits 2-3 of the nibble are reserved and must be 0; a marker that sets one is rejected as
 newer than this build understands. Segments created before slick-queue v1.4.0 carry no
 marker at all and are rejected at attach time.
 

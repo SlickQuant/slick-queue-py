@@ -2,7 +2,7 @@
 
 This document explains the intentional API differences between the C++ `slick::queue<T>` and Python `SlickQueue` implementations.
 
-Both track the same version line; this document describes slick-queue v2.0.0.
+Both track the same version line; this document describes slick-queue v2.1.0.
 
 ## Core Compatibility
 
@@ -26,6 +26,9 @@ slick::queue<uint8_t> q(queue_name);
 
 // Local memory mode
 slick::queue<uint8_t> q(queue_size); // No shared memory
+
+// Minimum of 64 items per reservation (one control slot per 64 items)
+slick::queue<uint8_t> q(queue_size, 64, queue_name);
 ```
 
 **Python:**
@@ -38,9 +41,16 @@ q = SlickQueue(name=queue_name, element_size=element_size)
 
 # Local memory mode
 q = SlickQueue(size=queue_size, element_size=element_size)  # No shared memory
+
+# Minimum of 64 items per reservation (one control slot per 64 items)
+q = SlickQueue(name=queue_name, size=queue_size, element_size=1, items_per_slot=64)
 ```
 
 **Rationale:** Python uses keyword arguments for clarity and supports both shared memory and local memory modes.
+
+`items_per_slot` is the one place the opener differs: C++ `queue(name)` can only adopt the
+segment's value, while Python's opener also accepts `items_per_slot=` and raises `ValueError`
+if the segment disagrees. Omitting it adopts the segment's value, exactly as C++ does.
 
 ---
 

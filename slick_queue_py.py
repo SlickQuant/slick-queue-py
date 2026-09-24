@@ -29,7 +29,7 @@ Supported on Python 3.8+ (uses multiprocessing.shared_memory).
 """
 from __future__ import annotations
 
-__version__ = '2.0.0'
+__version__ = '2.1.0'
 
 import struct
 import sys
@@ -47,7 +47,8 @@ from multiprocessing.shared_memory import SharedMemory
 # Offset 12-15: element_size (uint32_t)
 # Offset 16-23: std::atomic<uint64_t> last_published_ (8 bytes)
 # Offset 24-27: header_magic (uint32_t) - value 0x534C5131 ('SLQ1')
-# Offset 28-47: PADDING (20 bytes)
+# Offset 28-31: items_per_slot (uint32_t) - data items per control slot (0 reads as 1)
+# Offset 32-47: PADDING (16 bytes)
 # Offset 48-51: init_state (atomic uint32_t)
 # Offset 52-63: PADDING (12 bytes)
 HEADER_SIZE = 64
@@ -61,10 +62,23 @@ HEADER_MAGIC_OFFSET = 24
 # protocol get a bit; the purely local ones (reset check, loss detection, cpu relax)
 # cost nothing to mix on one segment and deliberately have none.
 #   bit 0    - the last-published index at LAST_PUBLISHED_OFFSET is maintained
-#   bits 1-3 - reserved for future shared-layout features, must be 0
+#   bit 1    - items_per_slot at ITEMS_PER_SLOT_OFFSET is not 1, so the control array
+#              is shorter than the data array
+#   bits 2-3 - reserved for future shared-layout features, must be 0
+#
+# Bit 1 exists for peers built before items_per_slot. They know nothing of offset 28 and
+# would index the control array one slot per element, but they already reject any feature
+# bit they do not recognise - so setting it only when items_per_slot != 1 makes exactly the
+# segments they would misread fail loudly, while a default segment still carries
+# 'SLQ1'/'SLQ0' and stays open to them.
 HEADER_MAGIC = 0x534C5131  # 'SLQ1' in little-endian
 HEADER_MAGIC_FEATURE_MASK = 0x0000000F  # feature nibble
 HEADER_MAGIC_READ_LAST = 0x1           # feature bit 0
+HEADER_MAGIC_ITEMS_PER_SLOT = 0x2      # feature bit 1
+HEADER_MAGIC_KNOWN_FEATURES = HEADER_MAGIC_READ_LAST | HEADER_MAGIC_ITEMS_PER_SLOT
+# Segments created before the field existed left it zeroed, which reads as 1 - exactly the
+# layout they have. Matches C++ queue.hpp ITEMS_PER_SLOT_OFFSET.
+ITEMS_PER_SLOT_OFFSET = 28
 INIT_STATE_OFFSET = 48
 
 # Init state constants (matches C++ queue.h)
@@ -248,10 +262,18 @@ class SlickQueue:
         traits: Feature configuration, a :class:`QueueTraits` subclass. Defaults to
             ``default_queue_traits``. ``enable_read_last`` must match across every
             peer of a shared memory segment; the others are local to this instance.
+        items_per_slot: The minimum number of elements a single ``reserve()``
+            consumes (power of 2, ``<= size``). ``reserve(n)`` rounds ``n`` up to a
+            multiple of it, and one control slot covers one such unit, so the control
+            array holds ``size // items_per_slot`` slots instead of ``size``. Use it for
+            byte buffers, where a 16-byte slot per element would dwarf the data.
+            Defaults to 1 when creating; when attaching to an existing segment by name
+            it defaults to the segment's value, and an explicit value must match it.
     """
 
     def __init__(self, *, name: Optional[str] = None, size: Optional[int] = None,
-                 element_size: Optional[int] = None, traits=None):
+                 element_size: Optional[int] = None, traits=None,
+                 items_per_slot: Optional[int] = None):
         # Traits first - the rest of construction, including the shared memory
         # layout marker, depends on the configuration.
         if traits is None:
@@ -270,7 +292,8 @@ class SlickQueue:
         self._enable_reset_check = self.traits.enable_reset_check
         self._enable_loss_detection = self.traits.enable_loss_detection
         self._enable_cpu_relax = self.traits.enable_cpu_relax
-        # The marker this queue writes as a creator and demands as an attacher.
+        # The read_last part of the marker, fixed by the traits. _header_magic_to_write()
+        # adds the items_per_slot bit once that is known.
         self._header_magic_expected = (
             HEADER_MAGIC if self._enable_read_last
             else HEADER_MAGIC & ~HEADER_MAGIC_READ_LAST
@@ -308,6 +331,7 @@ class SlickQueue:
             if self.size & (self.size - 1):
                 raise ValueError("size must be a power of two")
             self.mask = self.size - 1
+            self._set_items_per_slot(1 if items_per_slot is None else items_per_slot)
 
         if element_size is not None:
             self.element_size = int(element_size)
@@ -318,7 +342,7 @@ class SlickQueue:
                 # create shared memory
                 if element_size is None:
                     raise ValueError("size and element_size required when creating")
-                total = HEADER_SIZE + SLOT_SIZE * self.size + self.element_size * self.size
+                total = self._layout_data_offset() + self.element_size * self.size
                 try:
                     self._shm = SharedMemory(name=self.name, create=True, size=total)
                     # print(f"**** create new shm {self.name}")
@@ -344,7 +368,7 @@ class SlickQueue:
                     # maintains the last-published index and one that does not can no
                     # longer end up sharing a segment in either direction. Stored
                     # unconditionally so a recycled segment cannot leave a stale marker.
-                    struct.pack_into("<I", buf, HEADER_MAGIC_OFFSET, self._header_magic_expected)
+                    struct.pack_into("<I", buf, HEADER_MAGIC_OFFSET, self._header_magic_to_write())
 
                     # Initialize reserved_info atomic at offset 0
                     atomic_reserved = AtomicReservedInfo(buf, 0)
@@ -356,13 +380,12 @@ class SlickQueue:
                     # header whether or not this peer maintains it.
                     struct.pack_into("<Q", buf, LAST_PUBLISHED_OFFSET, K_INVALID_INDEX)
 
-                    # Write size and element_size at offsets 8 and 12
+                    # Write size and element_size at offsets 8 and 12, and items_per_slot
                     struct.pack_into("<I I", buf, SIZE_OFFSET, self.size, element_size)
+                    struct.pack_into("<I", buf, ITEMS_PER_SLOT_OFFSET, self.items_per_slot)
 
                     # Initialize slots data_index to max (uint64 max)
-                    for i in range(self.size):
-                        off = HEADER_SIZE + i * SLOT_SIZE
-                        struct.pack_into(SLOT_FMT, buf, off, K_INVALID_INDEX, 1)
+                    self._init_slots(buf)
 
                     # Mark initialization complete
                     init_state_atomic.store_release(INIT_STATE_READY)
@@ -391,6 +414,13 @@ class SlickQueue:
                     if ss[1] != element_size:
                         self._shm.close()
                         raise ValueError(f"element size mismatch. Expected {element_size} but got {ss[1]}")
+                    shm_items_per_slot = self._read_items_per_slot(buf)
+                    if shm_items_per_slot != self.items_per_slot:
+                        self._shm.close()
+                        raise ValueError(
+                            f"items_per_slot mismatch. Expected {self.items_per_slot} "
+                            f"but got {shm_items_per_slot}"
+                        )
             else:
                 # print(f"**** open existing shm {self.name}")
                 # open existing and read size from header
@@ -425,28 +455,32 @@ class SlickQueue:
                 self.mask = self.size - 1
                 self.element_size = int(element_size)
 
+                # Adopt the segment's granularity, as size is adopted above. An explicit
+                # items_per_slot is a statement of what the caller expects, so hold the
+                # segment to it.
+                shm_items_per_slot = self._read_items_per_slot(buf)
+                if items_per_slot is not None and int(items_per_slot) != shm_items_per_slot:
+                    self._shm.close()
+                    raise ValueError(
+                        f"items_per_slot mismatch. Expected {int(items_per_slot)} "
+                        f"but got {shm_items_per_slot}"
+                    )
+                try:
+                    self._set_items_per_slot(shm_items_per_slot)
+                except ValueError as e:
+                    self._shm.close()
+                    raise RuntimeError(f"Shared memory items_per_slot is invalid: {e}") from e
+
             self._buf = self._shm.buf
-            self._control_offset = HEADER_SIZE
-            self._data_offset = HEADER_SIZE + SLOT_SIZE * self.size
-
-            # Initialize atomic wrappers for lock-free operations
-            self._atomic_reserved = AtomicReservedInfo(self._buf, 0)
-            self._atomic_slots = []
-            for i in range(self.size):
-                slot_offset = HEADER_SIZE + i * SLOT_SIZE
-                self._atomic_slots.append(AtomicUInt64(self._buf, slot_offset))
-
-            # Initialize last_published atomic only when this queue maintains it
-            if self._enable_read_last:
-                self._atomic_last_published = AtomicUInt64(self._buf, LAST_PUBLISHED_OFFSET)
+            self._setup_views()
         else:
             # Local memory mode (C++ with shm_name == nullptr)
             if size is None or element_size is None:
                 raise ValueError("size and element_size required for local memory mode")
 
-            # Create local buffers (equivalent to C++ new T[size_] and new slot[size_])
+            # Create local buffers (equivalent to C++ new T[size_] and new slot[slot_count])
             # We use a bytearray to simulate the memory layout
-            total = HEADER_SIZE + SLOT_SIZE * self.size + self.element_size * self.size
+            total = self._layout_data_offset() + self.element_size * self.size
             self._local_buf = bytearray(total)
 
             # Initialize header with modern format (local mode always uses modern format)
@@ -456,30 +490,87 @@ class SlickQueue:
             # Initialize last_published at offset 16 with kInvalidIndex
             struct.pack_into("<Q", self._local_buf, LAST_PUBLISHED_OFFSET, K_INVALID_INDEX)
             # Write header_magic at offset 24
-            struct.pack_into("<I", self._local_buf, HEADER_MAGIC_OFFSET, self._header_magic_expected)
+            struct.pack_into("<I", self._local_buf, HEADER_MAGIC_OFFSET, self._header_magic_to_write())
+            # Write items_per_slot at offset 28
+            struct.pack_into("<I", self._local_buf, ITEMS_PER_SLOT_OFFSET, self.items_per_slot)
             # Write init_state = READY at offset 48
             struct.pack_into("<I", self._local_buf, INIT_STATE_OFFSET, INIT_STATE_READY)
 
             # Initialize slots data_index to max
-            for i in range(self.size):
-                off = HEADER_SIZE + i * SLOT_SIZE
-                struct.pack_into(SLOT_FMT, self._local_buf, off, K_INVALID_INDEX, 1)
+            self._init_slots(self._local_buf)
 
             # Create a memoryview for consistency with shared memory path
             self._buf = memoryview(self._local_buf)
-            self._control_offset = HEADER_SIZE
-            self._data_offset = HEADER_SIZE + SLOT_SIZE * self.size
+            self._setup_views()
 
-            # Initialize atomic wrappers (these work on local memory too)
-            self._atomic_reserved = AtomicReservedInfo(self._buf, 0)
-            self._atomic_slots = []
-            for i in range(self.size):
-                slot_offset = HEADER_SIZE + i * SLOT_SIZE
-                self._atomic_slots.append(AtomicUInt64(self._buf, slot_offset))
+    def _set_items_per_slot(self, items_per_slot: int) -> None:
+        """Validate items_per_slot against size and derive the slot geometry from it.
 
-            # Initialize last_published atomic only when this queue maintains it
-            if self._enable_read_last:
-                self._atomic_last_published = AtomicUInt64(self._buf, LAST_PUBLISHED_OFFSET)
+        Matches C++ queue.hpp set_items_per_slot(). Shared by the creating paths and
+        the attacher, which adopts the value from the header.
+        """
+        items_per_slot = int(items_per_slot)
+        if items_per_slot <= 0 or items_per_slot & (items_per_slot - 1):
+            raise ValueError("items_per_slot must be a power of two")
+        # Both are powers of two, so this also guarantees size is a multiple of
+        # items_per_slot and slot_count >= 1.
+        if items_per_slot > self.size:
+            raise ValueError(f"items_per_slot {items_per_slot} > queue size {self.size}")
+        self.items_per_slot = items_per_slot
+        self._item_mask = items_per_slot - 1
+        self._slot_shift = items_per_slot.bit_length() - 1
+        self.slot_count = self.size >> self._slot_shift
+
+    @staticmethod
+    def _read_items_per_slot(buf: memoryview) -> int:
+        """Segments created before the field existed left it zeroed; they have one
+        control slot per element, which is what 1 means."""
+        value = struct.unpack_from("<I", buf, ITEMS_PER_SLOT_OFFSET)[0]
+        return value if value else 1
+
+    def _init_slots(self, buf) -> None:
+        """Mark every control slot empty (C++ placement-new slot[slot_count])."""
+        for i in range(self.slot_count):
+            struct.pack_into(SLOT_FMT, buf, HEADER_SIZE + i * SLOT_SIZE, K_INVALID_INDEX, 1)
+
+    def _layout_data_offset(self) -> int:
+        """Byte offset of the data array from the start of the segment.
+
+        Matches C++ queue.hpp data_offset(). With one control slot per element this is
+        the legacy layout, byte for byte, so peers built before items_per_slot still read
+        it. A shorter control array can leave the end of the control area misaligned for
+        the C++ element type - 64 + 16 = 80 for a single slot - so it is padded up to the
+        lowest set bit of element_size. That is always a multiple of the C++ alignof(T)
+        (an alignment is a power of two dividing the size), and it is derivable from the
+        header, which is all this side knows about T. Older peers never see the padding:
+        a segment with items_per_slot != 1 carries the marker bit that turns them away.
+        """
+        end = HEADER_SIZE + SLOT_SIZE * self.slot_count
+        if self.items_per_slot == 1:
+            return end
+        alignment = self.element_size & -self.element_size
+        return (end + alignment - 1) & ~(alignment - 1)
+
+    def _setup_views(self) -> None:
+        """Locate the control and data arrays in self._buf and create the atomic
+        wrappers over them. Shared by the shared-memory and local paths."""
+        self._control_offset = HEADER_SIZE
+        self._data_offset = self._layout_data_offset()
+
+        # Initialize atomic wrappers for lock-free operations
+        self._atomic_reserved = AtomicReservedInfo(self._buf, 0)
+        self._atomic_slots = [
+            AtomicUInt64(self._buf, HEADER_SIZE + i * SLOT_SIZE)
+            for i in range(self.slot_count)
+        ]
+
+        # Initialize last_published atomic only when this queue maintains it
+        if self._enable_read_last:
+            self._atomic_last_published = AtomicUInt64(self._buf, LAST_PUBLISHED_OFFSET)
+
+    def _align_up(self, n: int) -> int:
+        """Round n up to a whole number of control slots' worth of elements."""
+        return (n + self._item_mask) & ~self._item_mask
 
     @staticmethod
     def _wait_for_shared_memory_ready(buf: memoryview) -> bool:
@@ -535,15 +626,17 @@ class SlickQueue:
         Args:
             buf: Memory buffer to check
 
+        The items_per_slot bit is not matched against this queue: an attacher by name
+        adopts the segment's value, and the creator path compares the field itself with
+        a precise error. Here it is only required to agree with that field.
+
         Raises:
             RuntimeError: If the segment carries no marker (created before v1.4.0),
-                was created with unknown layout features, or disagrees about
-                enable_read_last.
+                was created with unknown layout features, disagrees about
+                enable_read_last, or its items_per_slot bit disagrees with the field.
         """
         expected = self._header_magic_expected
         magic = struct.unpack_from("<I", buf, HEADER_MAGIC_OFFSET)[0]
-        if magic == expected:
-            return
 
         if (magic & ~HEADER_MAGIC_FEATURE_MASK) != (HEADER_MAGIC & ~HEADER_MAGIC_FEATURE_MASK):
             raise RuntimeError(
@@ -552,18 +645,32 @@ class SlickQueue:
                 "created before v1.4.0 carry no marker and are not supported"
             )
 
-        if (magic & HEADER_MAGIC_FEATURE_MASK & ~HEADER_MAGIC_READ_LAST) != 0:
+        if (magic & HEADER_MAGIC_FEATURE_MASK & ~HEADER_MAGIC_KNOWN_FEATURES) != 0:
             raise RuntimeError(
                 "Shared memory was created with unknown layout features. Marker "
                 f"{self._to_hex(magic)} is newer than this build understands "
-                f"({self._to_hex(expected)})"
+                f"({self._to_hex(expected | HEADER_MAGIC_KNOWN_FEATURES)})"
             )
 
-        raise RuntimeError(
-            "Shared memory feature mismatch: the segment was created with "
-            f"enable_read_last={bool(magic & HEADER_MAGIC_READ_LAST)} but this queue "
-            f"has enable_read_last={self._enable_read_last}"
-        )
+        if (magic & HEADER_MAGIC_READ_LAST) != (expected & HEADER_MAGIC_READ_LAST):
+            raise RuntimeError(
+                "Shared memory feature mismatch: the segment was created with "
+                f"enable_read_last={bool(magic & HEADER_MAGIC_READ_LAST)} but this queue "
+                f"has enable_read_last={self._enable_read_last}"
+            )
+
+        items_per_slot = self._read_items_per_slot(buf)
+        if bool(magic & HEADER_MAGIC_ITEMS_PER_SLOT) != (items_per_slot != 1):
+            raise RuntimeError(
+                f"Shared memory layout marker {self._to_hex(magic)} disagrees with its "
+                f"items_per_slot field ({items_per_slot}); the segment is corrupt"
+            )
+
+    def _header_magic_to_write(self) -> int:
+        """The marker this queue writes as a creator: the traits part plus the
+        items_per_slot bit. Matches C++ header_magic_expected()."""
+        bit = HEADER_MAGIC_ITEMS_PER_SLOT if self.items_per_slot != 1 else 0
+        return self._header_magic_expected | bit
 
     def _cpu_relax(self) -> None:
         """
@@ -610,13 +717,14 @@ class SlickQueue:
         packed = make_reserved_info(int(index), int(sz))
         struct.pack_into(AtomicReservedInfo.RESERVED_INFO_FMT, self._buf, 0, packed)
 
-    def _read_slot(self, idx: int) -> Tuple[int, int]:
-        off = self._control_offset + idx * SLOT_SIZE
+    # slot_idx is a control-slot index, (index & mask) >> _slot_shift, not a data index.
+    def _read_slot(self, slot_idx: int) -> Tuple[int, int]:
+        off = self._control_offset + slot_idx * SLOT_SIZE
         data_index, size = struct.unpack_from(SLOT_FMT, self._buf, off)
         return int(data_index), int(size)
 
-    def _write_slot(self, idx: int, data_index: int, size: int) -> None:
-        off = self._control_offset + idx * SLOT_SIZE
+    def _write_slot(self, slot_idx: int, data_index: int, size: int) -> None:
+        off = self._control_offset + slot_idx * SLOT_SIZE
         struct.pack_into(SLOT_FMT, self._buf, off, int(data_index), int(size))
 
     def get_shm_name(self) -> Optional[str]:
@@ -666,6 +774,11 @@ class SlickQueue:
         if n > self.size:
             raise RuntimeError(f"required size {n} > queue size {self.size}")
 
+        # The footprint in the ring: n rounded up to whole control slots. The index
+        # therefore always stays a multiple of items_per_slot, which is what lets
+        # (index & mask) >> slot_shift give every reservation its own slot.
+        need = self._align_up(n)
+
         # CAS loop for multi-producer safety (matching C++ line 189-205)
         while True:
             # Load current reserved_info with memory_order_relaxed (C++ line 185)
@@ -676,15 +789,15 @@ class SlickQueue:
             buffer_wrapped = False
 
             # Check if we need to wrap (C++ lines 194-204)
-            if (idx + n) > self.size:
+            if (idx + need) > self.size:
                 # Wrap to beginning
                 index += self.size - idx
-                next_index = index + n
+                next_index = index + need
                 next_size = n
                 buffer_wrapped = True
             else:
                 # Normal increment
-                next_index = reserved_index + n
+                next_index = reserved_index + need
                 next_size = n
 
             # Atomic CAS with memory_order_release on success (C++ line 205)
@@ -697,7 +810,7 @@ class SlickQueue:
                 # CAS succeeded, we own this reservation
                 if buffer_wrapped:
                     # Publish wrap marker (C++ lines 206-211)
-                    slot_idx = reserved_index & self.mask
+                    slot_idx = (reserved_index & self.mask) >> self._slot_shift
                     self._write_slot(slot_idx, index, n)
                 return index
 
@@ -714,7 +827,7 @@ class SlickQueue:
             index: Index returned by reserve()
             n: Number of slots to publish (default 1)
         """
-        slot_idx = index & self.mask
+        slot_idx = (index & self.mask) >> self._slot_shift
 
         # Write slot size. Relaxed: the release store below is what publishes it, and
         # a reader that acquires data_index therefore sees this size.
@@ -815,7 +928,8 @@ class SlickQueue:
                 continue
 
             idx = read_index & self.mask
-            slot = self._atomic_slots[idx]
+            slot_idx = idx >> self._slot_shift
+            slot = self._atomic_slots[slot_idx]
 
             # Atomic load with memory_order_acquire
             data_index = slot.load_acquire()
@@ -849,7 +963,7 @@ class SlickQueue:
             # rather than report "no data": the next pass sees the new index and
             # either reads it or skips the lap, and the producer must complete another
             # whole lap to trigger this again, so it cannot spin.
-            size_offset = self._control_offset + idx * SLOT_SIZE + SLOT_SIZE_OFFSET
+            size_offset = self._control_offset + slot_idx * SLOT_SIZE + SLOT_SIZE_OFFSET
             slot_size = struct.unpack_from("<I", self._buf, size_offset)[0]
             if slot.load_acquire() != data_index:
                 continue
@@ -859,10 +973,11 @@ class SlickQueue:
 
             # data_index and read_index select the same slot here: they are either
             # equal, or data_index ran ahead within this same slot, which the branch
-            # above required.
+            # above required. Advance by the footprint reserve() consumed, not the
+            # published size, so the cursor lands on the next reservation's slot.
             data_off = self._data_offset + idx * self.element_size
             data = bytes(self._buf[data_off: data_off + slot_size * self.element_size])
-            new_read_index = data_index + slot_size
+            new_read_index = data_index + self._align_up(slot_size)
             return data, slot_size, new_read_index
 
     def _read_atomic_cursor(self, read_index: AtomicCursor) -> Tuple[Optional[bytes], int, int]:
@@ -895,7 +1010,8 @@ class SlickQueue:
                 continue
 
             idx = current_index & self.mask
-            slot = self._atomic_slots[idx]
+            slot_idx = idx >> self._slot_shift
+            slot = self._atomic_slots[slot_idx]
 
             # Load slot data_index
             data_index = slot.load_acquire()
@@ -921,13 +1037,13 @@ class SlickQueue:
             # the size handed back to the caller. Validating after the CAS instead
             # would be wrong: the claim would already have been published to the other
             # consumers, and refusing to return the item would drop it for all of them.
-            size_offset = self._control_offset + idx * SLOT_SIZE + SLOT_SIZE_OFFSET
+            size_offset = self._control_offset + slot_idx * SLOT_SIZE + SLOT_SIZE_OFFSET
             slot_size = struct.unpack_from("<I", self._buf, size_offset)[0]
             if slot.load_acquire() != data_index:
                 continue
 
             # Try to atomically claim this item
-            next_index = data_index + slot_size
+            next_index = data_index + self._align_up(slot_size)
             success, _ = read_index.compare_exchange_weak(current_index, next_index)
 
             if success:
@@ -999,7 +1115,8 @@ class SlickQueue:
         if last_index == K_INVALID_INDEX:
             return None, 0
 
-        slot_idx = last_index & self.mask
+        idx = last_index & self.mask
+        slot_idx = idx >> self._slot_shift
         slot = self._atomic_slots[slot_idx]
 
         # The slot may already have been recycled by a wrapping producer, and publish()
@@ -1015,7 +1132,7 @@ class SlickQueue:
         if slot.load_acquire() != last_index:
             return None, 0
 
-        data_off = self._data_offset + slot_idx * self.element_size
+        data_off = self._data_offset + idx * self.element_size
         data = bytes(self._buf[data_off: data_off + slot_size * self.element_size])
         return data, slot_size
     
@@ -1029,8 +1146,7 @@ class SlickQueue:
         # Clear the control array before rewinding the counter, so a stale reader that
         # is still using its old cursor sees an invalid slot rather than fresh data at
         # a stale index. This is the ordering _was_reset() is written against.
-        for i in range(self.size):
-            self._write_slot(i, K_INVALID_INDEX, 1)
+        self._init_slots(self._buf)
 
         # Reset reserved_info to initial state. Unconditional: the counter lives at
         # offset 0 of the buffer in local mode too.

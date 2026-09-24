@@ -104,9 +104,9 @@ def test_memory_layout_matches_cpp():
     from slick_queue_py import (
         HEADER_SIZE, SLOT_SIZE, SLOT_SIZE_OFFSET,
         SIZE_OFFSET, ELEMENT_SIZE_OFFSET,
-        LAST_PUBLISHED_OFFSET, HEADER_MAGIC_OFFSET,
+        LAST_PUBLISHED_OFFSET, HEADER_MAGIC_OFFSET, ITEMS_PER_SLOT_OFFSET,
         INIT_STATE_OFFSET, HEADER_MAGIC,
-        HEADER_MAGIC_FEATURE_MASK, HEADER_MAGIC_READ_LAST
+        HEADER_MAGIC_FEATURE_MASK, HEADER_MAGIC_READ_LAST, HEADER_MAGIC_ITEMS_PER_SLOT
     )
 
     # Verify offsets match C++ queue.h:107-135
@@ -114,6 +114,7 @@ def test_memory_layout_matches_cpp():
     assert ELEMENT_SIZE_OFFSET == 12, "element_size offset should be 12"
     assert LAST_PUBLISHED_OFFSET == 16, "last_published offset should be 16"
     assert HEADER_MAGIC_OFFSET == 24, "header_magic offset should be 24"
+    assert ITEMS_PER_SLOT_OFFSET == 28, "items_per_slot offset should be 28"
     assert INIT_STATE_OFFSET == 48, "init_state offset should be 48"
     assert HEADER_SIZE == 64, "Header size should be 64 bytes"
     assert SLOT_SIZE == 16, "Slot size should be 16 bytes"
@@ -123,6 +124,7 @@ def test_memory_layout_matches_cpp():
     assert HEADER_MAGIC == 0x534C5131, "header magic should be 'SLQ1'"
     assert HEADER_MAGIC_FEATURE_MASK == 0x0000000F, "feature nibble should be the low 4 bits"
     assert HEADER_MAGIC_READ_LAST == 0x1, "read_last should be feature bit 0"
+    assert HEADER_MAGIC_ITEMS_PER_SLOT == 0x2, "items_per_slot != 1 should be feature bit 1"
     assert HEADER_MAGIC & ~HEADER_MAGIC_READ_LAST == 0x534C5130, "cleared bit 0 should be 'SLQ0'"
 
     print("[PASS] Memory layout offsets match C++ implementation")

@@ -147,6 +147,12 @@ add_test(
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 )
 
+add_test(
+    NAME items_per_slot_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/test_items_per_slot.py
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+)
+
 # Set timeouts for all tests to prevent CI hangs
 set_tests_properties(
     atomic_ops_test
@@ -164,5 +170,6 @@ set_tests_properties(
     traits_test
     reset_detection_test
     wrap_invariants_test
+    items_per_slot_test
     PROPERTIES TIMEOUT 120
 )

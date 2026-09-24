@@ -1,5 +1,69 @@
 # Changelogs
 
+## [v2.1.0] - 2026-09-24
+
+Tracks C++ slick-queue v2.1.0. Adds `items_per_slot`, so one control slot can
+cover several elements and a byte buffer no longer carries a 16-byte control
+slot per byte. With the default of 1 the shared-memory layout is unchanged, and
+2.0.0 peers in either language interoperate as before.
+
+### Added
+
+- `items_per_slot=` argument on `SlickQueue`: the minimum number of elements a
+  single `reserve()` consumes (a power of 2, `<= size`). `reserve(n)` rounds `n`
+  up to a multiple of it and one control slot covers one such unit, so the
+  control array holds `size // items_per_slot` slots instead of `size`. A 16M
+  byte buffer drops from 256 MB of control to 4 MB with `items_per_slot=64`, at
+  the cost that a message shorter than the minimum still takes a whole unit.
+- `read()` returns the published size and advances the cursor by the whole units
+  the reservation consumed. The geometry is exposed as `q.items_per_slot` and
+  `q.slot_count`.
+- Defaults to 1 when creating. Opening an existing segment by name adopts the
+  segment's value, as `size` is adopted; passing one explicitly raises
+  `ValueError` if the segment disagrees. C++'s attacher can only adopt - see
+  `API_DIFFERENCES.md`.
+- Constants `ITEMS_PER_SLOT_OFFSET`, `HEADER_MAGIC_ITEMS_PER_SLOT` and
+  `HEADER_MAGIC_KNOWN_FEATURES`.
+
+### Shared-Memory Layout
+
+- `items_per_slot` is stored at header offset 28, previously padding. A zero
+  field - every segment created by 2.0.0 and earlier - reads as 1. A creator
+  opening a segment with a different value raises `ValueError`.
+- Layout marker feature bit 1 is set when `items_per_slot != 1` (`'SLQ3'`, or
+  `'SLQ2'` without `enable_read_last`). slick-queue-py 2.0.0 and C++ slick-queue
+  2.0.0 reject feature bits they do not recognise, so they refuse such a segment
+  at attach time instead of misreading it; default segments keep
+  `'SLQ1'`/`'SLQ0'`. A marker whose bit disagrees with the offset-28 field
+  raises `RuntimeError`.
+- When `items_per_slot != 1` the data array is padded to the lowest set bit of
+  `element_size`, matching C++, so the offset agrees with a C++ peer whose
+  element type is over-aligned.
+
+### Changed
+
+- Local and shared-memory construction, and `reset()`, share helpers for slot
+  initialisation and view setup instead of repeating them per path.
+
+### Tests
+
+- New `tests/test_items_per_slot.py` with 20 tests: geometry, reservation
+  rounding, cursor advance by unit for both read paths, multi-unit messages,
+  mid-buffer wrap, `read_last()` after wrap, `reset()`, loss counting in
+  elements, attacher adoption and mismatch on both attach paths, the legacy zero
+  field, the marker bit in each configuration, a marker contradicting its field,
+  and data-array padding.
+- `test_modern_format.py` asserts the new offset and marker bit.
+  `test_attach_rejects_unknown_feature_bits` uses bit 2, since bit 1 now has a
+  meaning.
+
+Checked against C++ built from the v2.1.0 header in both directions - byte
+elements with `items_per_slot=16`, and an `alignas(32)` element with a single
+control slot - and against unmodified 2.0.0 code in both languages, which
+refuses an `'SLQ3'` segment and still attaches to an `'SLQ1'` one. The interop
+tests in `tests/` fetch slick-queue from GitHub, so they exercise the default
+layout until the v2.1.0 release is published.
+
 ## [v2.0.0] - 2026-09-07
 
 Tracks C++ slick-queue v2.0.0. Feature configuration moves to a `traits`
