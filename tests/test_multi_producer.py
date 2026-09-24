@@ -106,7 +106,33 @@ def create_or_open_queue(name, size, element_size):
 #     except Exception as e:
 #         results_queue.put(('error', worker_id, str(e)))
 
-def producer_worker(shm_name, element_size, num_items, worker_id, results_queue, publish_n_items_at_once = 1):
+def make_flow_control(size, batch_sizes):
+    """Shared consumer position and the lead producers may keep over it.
+
+    SlickQueue is lossy: a producer never waits, so one that runs a whole ring ahead
+    overwrites records the consumer has not read yet. A descheduled consumer on a
+    loaded CI runner gets lapped that way, never reaches its expected count, and the
+    test times out. These tests check reservation, wrap and publish correctness, not
+    overrun, so producers hold back until the consumer is far enough behind.
+
+    Every producer can pass the check at once before any of them reserves, and a
+    reservation of b items can use up to 2b - 1 indices (b plus up to b - 1 skipped
+    at the wrap), so the lead is the ring size less that worst-case total.
+    """
+    max_ahead = size - sum(2 * b - 1 for b in batch_sizes)
+    assert max_ahead >= 0, f"queue of {size} too small for batches {batch_sizes}"
+    return Value('q', 0, lock=False), max_ahead
+
+
+def wait_for_room(q, consumer_pos, max_ahead):
+    """Block until reserving cannot lap the consumer (see make_flow_control)."""
+    # initial_reading_index() is the producers' reservation counter
+    while q.initial_reading_index() - consumer_pos.value > max_ahead:
+        time.sleep(0.0005)
+
+
+def producer_worker(shm_name, element_size, num_items, worker_id, results_queue, publish_n_items_at_once = 1,
+                    consumer_pos = None, max_ahead = 0):
     """Producer worker: reserves slots, writes data, and publishes."""
     try:
         while not os.path.exists('ready'):
@@ -123,6 +149,8 @@ def producer_worker(shm_name, element_size, num_items, worker_id, results_queue,
             # Reserve a slot
             time.sleep(random.uniform(0.002, 0.005))
             count = min(publish_n_items_at_once, num_items - i)
+            if consumer_pos is not None:
+                wait_for_room(q, consumer_pos, max_ahead)
             idx = q.reserve(count)
             # print(f'{worker_id} reserve: {count} {idx}')
             n = count
@@ -149,7 +177,7 @@ def producer_worker(shm_name, element_size, num_items, worker_id, results_queue,
         results_queue.put(('error', worker_id, str(e)))
 
 
-def consumer_worker(shm_name, element_size, expected_count, worker_id, results_queue):
+def consumer_worker(shm_name, element_size, expected_count, worker_id, results_queue, consumer_pos = None):
     """Consumer worker: reads items from queue."""
     try:
         # Open existing queue
@@ -165,6 +193,9 @@ def consumer_worker(shm_name, element_size, expected_count, worker_id, results_q
         # Keep reading until we've consumed expected_count items
         while len(consumed) < expected_count:
             data, size, read_index = q.read(read_index)
+            if consumer_pos is not None:
+                # read() has already copied the record out, so its slots are free
+                consumer_pos.value = read_index
             offset = 0
             if data is not None:
                 index = read_index - size
@@ -209,6 +240,7 @@ def test_single_producer_single_consumer():
 
     # Create queue (with automatic cleanup if needed)
     q = create_or_open_queue(shm_name, size, element_size)
+    consumer_pos, max_ahead = make_flow_control(size, [1])
     # Keep queue open while children access it
 
     p_proc = None
@@ -224,12 +256,12 @@ def test_single_producer_single_consumer():
 
         # Start producer
         p_proc = Process(target=producer_worker,
-                        args=(shm_name, element_size, num_items, 1, results))
+                        args=(shm_name, element_size, num_items, 1, results, 1, consumer_pos, max_ahead))
         p_proc.start()
 
         # Start consumer
         c_proc = Process(target=consumer_worker,
-                        args=(shm_name, element_size, num_items, 1, results))
+                        args=(shm_name, element_size, num_items, 1, results, consumer_pos))
         c_proc.start()
 
         # Collect results concurrently while processes run
@@ -325,6 +357,7 @@ def test_multi_producer_single_consumer():
 
     # Create queue (with automatic cleanup if needed)
     q = create_or_open_queue(shm_name, size, element_size)
+    consumer_pos, max_ahead = make_flow_control(size, [1] * num_producers)
     # Keep queue open
 
     producers = []
@@ -340,13 +373,13 @@ def test_multi_producer_single_consumer():
 
         # Start single consumer
         consumer = Process(target=consumer_worker,
-                          args=(shm_name, element_size, total_items, 0, results))
+                          args=(shm_name, element_size, total_items, 0, results, consumer_pos))
         consumer.start()
 
         # Start multiple producers
         for i in range(num_producers):
             p = Process(target=producer_worker,
-                       args=(shm_name, element_size, items_per_producer, i, results))
+                       args=(shm_name, element_size, items_per_producer, i, results, 1, consumer_pos, max_ahead))
             p.start()
             producers.append(p)
 
@@ -447,6 +480,7 @@ def test_stress_high_contention():
 
     # Create queue (with automatic cleanup if needed)
     q = create_or_open_queue(shm_name, size, element_size)
+    consumer_pos, max_ahead = make_flow_control(size, [1] * num_producers)
     q.reset()
     # Keep queue open
 
@@ -463,7 +497,7 @@ def test_stress_high_contention():
 
         # Start single consumer
         consumer = Process(target=consumer_worker,
-                          args=(shm_name, element_size, total_items, 0, results))
+                          args=(shm_name, element_size, total_items, 0, results, consumer_pos))
         consumer.start()
 
         time.sleep(0.5)
@@ -473,7 +507,7 @@ def test_stress_high_contention():
 
         for i in range(num_producers):
             p = Process(target=producer_worker,
-                       args=(shm_name, element_size, items_per_producer, i, results))
+                       args=(shm_name, element_size, items_per_producer, i, results, 1, consumer_pos, max_ahead))
             p.start()
             producers.append(p)
 
@@ -584,6 +618,8 @@ def test_wrap_around():
 
     # Create queue (with automatic cleanup if needed)
     q = create_or_open_queue(shm_name, size, element_size)
+    batch_sizes = [i * 2 + 1 for i in range(num_producers)]
+    consumer_pos, max_ahead = make_flow_control(size, batch_sizes)
     q.reset()
     # Keep queue open
 
@@ -600,13 +636,14 @@ def test_wrap_around():
 
         # Start consumer
         consumer = Process(target=consumer_worker,
-                          args=(shm_name, element_size, total_items, 0, results))
+                          args=(shm_name, element_size, total_items, 0, results, consumer_pos))
         consumer.start()
 
         # Start producers
         for i in range(num_producers):
             p = Process(target=producer_worker,
-                       args=(shm_name, element_size, items_per_producer, i, results, i * 2 + 1))
+                       args=(shm_name, element_size, items_per_producer, i, results, batch_sizes[i],
+                             consumer_pos, max_ahead))
             p.start()
             producers.append(p)
 
