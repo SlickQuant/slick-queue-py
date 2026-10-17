@@ -2,7 +2,7 @@
 
 This document explains the intentional API differences between the C++ `slick::queue<T>` and Python `SlickQueue` implementations.
 
-Both track the same version line; this document describes slick-queue v2.1.0.
+Both track the same version line; this document describes slick-queue v2.3.0.
 
 ## Core Compatibility
 
@@ -227,26 +227,43 @@ q[idx][:4] = struct.pack("<i", 42)  # Manual packing
 {
     slick::queue<T> q(size, "name");
     // ... use queue ...
-}  // Destructor automatically cleans up
+    q.remove_shm();  // Coordinator, once no peer will attach again; q's mapping stays valid
+}  // Destructor unmaps; it never removes the segment
+
+slick::shm::shared_memory::remove("name");  // By name, without a queue - e.g. at startup
 ```
 
 **Python:**
 ```python
 # Option 1: Manual cleanup
-q = SlickQueue(name='name', size=size, element_size=elem_size, create=True)
+q = SlickQueue(name='name', size=size, element_size=elem_size)
 try:
     # ... use queue ...
 finally:
     q.close()
-    q.unlink()  # Only call from creator process
+    q.unlink()  # Only from the process that coordinates the queue's lifetime
 
-# Option 2: Context manager (recommended)
-with SlickQueue(name='name', size=size, element_size=elem_size, create=True) as q:
+# Option 2: Context manager - closes, never unlinks
+with SlickQueue(name='name', size=size, element_size=elem_size) as q:
     # ... use queue ...
-    pass  # Automatic cleanup
+    pass
+
+SlickQueue.remove('name')  # By name, without attaching - e.g. at startup
 ```
 
 **Rationale:** Python's garbage collection is non-deterministic, so explicit cleanup or context managers are needed.
+
+Neither side deletes a segment on its own, matching C++ v2.3.0: not the C++ destructor, and not
+Python's `close()`, context manager or process exit. Python keeps its segments out of
+`multiprocessing`'s resource tracker for this, since the tracker would otherwise unlink them when
+the process exits.
+
+| C++ | Python |
+|-----|--------|
+| `remove_shm()` | `remove_shm()` - same contract, unlinks by name on every call |
+| - | `unlink()` - unlinks once, valid after `close()`; a repeat is a no-op |
+| `slick::shm::shared_memory::remove(name)` | `SlickQueue.remove(name)` - also accepts a `/`-prefixed name |
+| `shm_name()` - `""` for a local queue | `get_shm_name()` - `None` for a local queue, `/`-prefixed on POSIX |
 
 ---
 
@@ -339,6 +356,7 @@ int main() {
 | Element access | Pointer | `memoryview` | Python memory safety |
 | Type safety | Templates | `struct` module | Language difference |
 | Cleanup | RAII (destructor) | Explicit or context manager | Python GC is non-deterministic |
+| Segment removal | `remove_shm()` | `remove_shm()`, `unlink()`, `SlickQueue.remove()` | Neither side unlinks on its own |
 | `read()` data | `T*` into the ring | `bytes` copy | No safe raw pointers in Python |
 | Overwritten-in-flight data | Caller sees a volatile pointer | Copy may hold a newer record's bytes | Detect with `loss_count()` |
 | Feature configuration | `Traits` template parameter | `traits=` argument | Python has no templates |

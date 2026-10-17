@@ -11,8 +11,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from multiprocessing.shared_memory import SharedMemory
-
 from atomic_ops import AtomicCursor
 from slick_queue_py import (
     SlickQueue,
@@ -21,6 +19,7 @@ from slick_queue_py import (
     SLOT_SIZE,
     HEADER_MAGIC_OFFSET,
     ITEMS_PER_SLOT_OFFSET,
+    _open_shm,
 )
 
 SLQ1 = 0x534C5131
@@ -37,7 +36,7 @@ def _marker(q):
 
 
 def _set_raw_marker(q, marker):
-    raw = SharedMemory(name=q._shm.name, create=False)
+    raw = _open_shm(q._shm.name, create=False)
     try:
         struct.pack_into("<I", raw.buf, HEADER_MAGIC_OFFSET, marker)
     finally:
@@ -364,7 +363,7 @@ def test_zero_in_header_reads_as_one():
     name = _unique("slq_ips_legacy")
     creator = SlickQueue(name=name, size=8, element_size=8)
     try:
-        raw = SharedMemory(name=creator._shm.name, create=False)
+        raw = _open_shm(creator._shm.name, create=False)
         try:
             struct.pack_into("<I", raw.buf, ITEMS_PER_SLOT_OFFSET, 0)
         finally:

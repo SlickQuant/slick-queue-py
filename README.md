@@ -564,11 +564,47 @@ Get memoryview for writing to reserved slot.
 
 #### `close()`
 
-Close the shared memory connection. Always call this before unlinking.
+Close the shared memory connection. Never deletes the segment.
 
 #### `unlink()`
 
-Delete the shared memory segment. Only call from the process that created it.
+Delete the shared memory segment this queue is attached to. Valid before or after `close()`
+(close every handle, then unlink once), and a no-op when repeated, so it cannot delete a segment
+a later run has since created under the same name. A no-op for local memory mode.
+
+#### `remove_shm() -> bool`
+
+Unlink the segment's name so the next queue created with it starts fresh, matching C++
+`remove_shm()`. Mappings already open, including this queue's own, stay valid. Unlike `unlink()`
+it unlinks by name on every call. Returns `False` for a local-memory queue or if the name is
+already gone, and always `True` for a shared queue on Windows.
+
+#### `SlickQueue.remove(name) -> bool`
+
+Unlink a segment by name without attaching to it, matching C++
+`slick::shm::shared_memory::remove()`. Typically called at startup to clear a segment a previous
+run left behind. Accepts the `/`-prefixed value of `get_shm_name()`. Always `True` on Windows.
+
+#### `get_shm_name() -> Optional[str]`
+
+The segment name to pass to C++ (`/`-prefixed on POSIX), or `None` for a local-memory queue.
+
+#### Segment lifetime
+
+No queue deletes its segment on its own: not `close()`, not the context manager, and not process
+exit, matching C++ slick-queue v2.3.0. On POSIX a name outlives every mapping until it is
+unlinked, so a departing process that unlinked it while a peer was still attached would leave that
+peer reading an orphaned mapping while a restarted process silently created a fresh segment under
+the same name. The process that coordinates the queue's lifetime calls `unlink()`, `remove_shm()`
+or `SlickQueue.remove(name)` once no peer will attach again; until then a restarted process
+reattaches to the existing segment and keeps its contents. On Windows a segment is freed when its
+last handle closes.
+
+The queue keeps its segments out of `multiprocessing`'s resource tracker, which would otherwise
+unlink them when the process exits - before Python 3.13, even in a process that only attached. It
+sends the tracker nothing at all: `track=False` on Python 3.13+, and on older POSIX Pythons a
+`SharedMemory` subclass that maps the segment without registering it, so there is no
+register/unregister pair to race between threads or between processes sharing one tracker.
 
 ### AtomicCursor
 
@@ -884,6 +920,9 @@ python tests/test_reset_detection.py
 
 # Wrapping-producer record/size invariants
 python tests/test_wrap_invariants.py
+
+# Segment lifetime: unlink(), remove_shm(), remove(), process exit
+python tests/test_segment_lifetime.py
 ```
 
 Or run everything with pytest:
@@ -927,7 +966,7 @@ The interop tests verify:
 
 1. **Buffer Cleanup Warning**: You may see a `BufferError: cannot close exported pointers exist` warning during garbage collection. This is a **harmless warning** caused by Python's ctypes creating internal buffer references that persist beyond explicit cleanup. It occurs during program exit and **does not affect functionality, performance, or correctness**. The queue works perfectly despite this warning.
 
-2. **UserWarning**: On Linux you may see `UserWarning: resource_tracker: There appear to be 4 leaked shared_memory objects to clean up at shutdown`. This is a **harmless warning** caused by Python's ctypes creating internal buffer references that persist beyond explicit cleanup. It occurs during program exit and **does not affect functionality, performance, or correctness**. The queue works perfectly despite this warning.
+2. **UserWarning**: On Linux you may see `UserWarning: resource_tracker: There appear to be 4 leaked shared_memory objects to clean up at shutdown`. `SlickQueue` keeps its own segments out of the resource tracker (see [Segment lifetime](#segment-lifetime)), so the warning comes from a `multiprocessing.shared_memory.SharedMemory` your code opened directly, such as one holding an `AtomicCursor`. The tracker unlinks those segments at exit; pass `track=False` (Python 3.13+) to keep them.
 
 ## Architecture
 

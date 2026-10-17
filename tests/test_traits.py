@@ -9,8 +9,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from multiprocessing.shared_memory import SharedMemory
-
 from slick_queue_py import (
     SlickQueue,
     QueueTraits,
@@ -24,6 +22,7 @@ from slick_queue_py import (
     INIT_STATE_OFFSET,
     INIT_STATE_READY,
     K_INVALID_INDEX,
+    _open_shm,
 )
 
 
@@ -475,9 +474,12 @@ def test_differently_configured_queues_coexist():
 
 
 def _make_raw_segment(name, size, element_size, magic):
-    """Build a segment by hand so a marker the library never writes can be tested."""
+    """Build a segment by hand so a marker the library never writes can be tested.
+
+    Through the library's own opener, so this handle and the queue that attaches to
+    the same name do not both claim it in the resource tracker before Python 3.13."""
     total = HEADER_SIZE + SLOT_SIZE * size + element_size * size
-    shm = SharedMemory(name=name, create=True, size=total)
+    shm = _open_shm(name, create=True, size=total)
     buf = shm.buf
     buf[:HEADER_SIZE] = bytes(HEADER_SIZE)
     struct.pack_into("<I I", buf, SIZE_OFFSET, size, element_size)
@@ -505,10 +507,7 @@ def test_attach_rejects_segment_without_marker():
             raise AssertionError("expected RuntimeError for an unmarked segment")
     finally:
         shm.close()
-        try:
-            shm.unlink()
-        except Exception:
-            pass
+        SlickQueue.remove(name)
 
 
 def test_attach_rejects_unknown_feature_bits():
@@ -526,10 +525,7 @@ def test_attach_rejects_unknown_feature_bits():
             raise AssertionError("expected RuntimeError for unknown feature bits")
     finally:
         shm.close()
-        try:
-            shm.unlink()
-        except Exception:
-            pass
+        SlickQueue.remove(name)
 
 
 # ------------------------------------------------------------------ reserve()

@@ -29,8 +29,11 @@ Supported on Python 3.8+ (uses multiprocessing.shared_memory).
 """
 from __future__ import annotations
 
-__version__ = '2.1.0'
+__version__ = '2.3.0'
 
+import inspect
+import mmap
+import os
 import struct
 import sys
 import time
@@ -39,6 +42,81 @@ from atomic_ops import AtomicReservedInfo, AtomicUInt64, AtomicCursor, check_pla
 
 # Use Python's built-in shared memory (available in Python 3.8+)
 from multiprocessing.shared_memory import SharedMemory
+
+# Python >= 3.13 supports SharedMemory(track=False), which keeps a segment out of
+# multiprocessing's resource tracker.
+_SHM_SUPPORTS_TRACK = 'track' in inspect.signature(SharedMemory.__init__).parameters
+
+if not _SHM_SUPPORTS_TRACK and sys.platform != 'win32':
+    import _posixshmem
+
+    class _UntrackedSharedMemory(SharedMemory):
+        """``SharedMemory(track=False)`` for POSIX Python < 3.13, where that
+        argument does not exist.
+
+        The base class touches the resource tracker in exactly two places, and
+        only those are replaced: ``__init__``, which registers the name, and
+        ``unlink()``, which unregisters it. This ``__init__`` sets the same
+        attributes the base one does, which ``close()``, ``buf``, ``name``,
+        ``size``, ``__del__`` and ``__reduce__`` rely on.
+
+        Sending the tracker nothing at all is what makes this safe. Registering
+        and then retracting at once needed a lock against other threads, which a
+        fork could leave held in the child, and still raced against other
+        processes sharing the tracker - multiprocessing children share their
+        parent's - which answers an UNREGISTER for a name it no longer holds by
+        printing a KeyError traceback.
+        """
+
+        def __init__(self, name: str, create: bool = False, size: int = 0):
+            flags = os.O_RDWR
+            if create:
+                if size <= 0:
+                    raise ValueError("'size' must be a positive number different from zero")
+                flags |= os.O_CREAT | os.O_EXCL
+            self._name = '/' + name
+            self._fd = _posixshmem.shm_open(self._name, flags, mode=self._mode)
+            try:
+                if create:
+                    os.ftruncate(self._fd, size)
+                size = os.fstat(self._fd).st_size
+                self._mmap = mmap.mmap(self._fd, size)
+            except OSError:
+                os.close(self._fd)
+                self._fd = -1
+                if create:  # only a segment this call made is ours to delete
+                    try:
+                        _posixshmem.shm_unlink(self._name)
+                    except OSError:
+                        pass
+                raise
+            self._size = size
+            self._buf = memoryview(self._mmap)
+
+        def unlink(self) -> None:
+            if self._name:
+                _posixshmem.shm_unlink(self._name)
+
+
+def _open_shm(name: str, create: bool, size: int = 0) -> SharedMemory:
+    """Create or attach to a segment without registering it with
+    multiprocessing's resource tracker.
+
+    A registered name is unlinked by the tracker when the process exits, which on
+    POSIX is the lifetime C++ slick-queue v2.3.0 dropped: a peer still attached
+    keeps reading the orphaned mapping while a restarted process silently
+    creates a fresh segment under the same name, so the two never meet again.
+    Python before 3.13 registers on attach as well as on create, so any peer's
+    exit removed the segment. The name now outlives every process until
+    remove_shm(), unlink() or remove() is called. Windows has no tracker; a
+    section there dies with its last handle.
+    """
+    if _SHM_SUPPORTS_TRACK:
+        return SharedMemory(name=name, create=create, size=size, track=False)
+    if sys.platform == 'win32':
+        return SharedMemory(name=name, create=create, size=size)
+    return _UntrackedSharedMemory(name, create, size)
+
 
 # Layout constants
 # Shared memory header layout (64 bytes total):
@@ -318,6 +396,9 @@ class SlickQueue:
 
         self.use_shm = name is not None
         self._shm: Optional[SharedMemory] = None
+        # Tracker-form name of the mapping. Outlives close(), which drops _shm, so
+        # unlink() still knows what to unlink - see unlink().
+        self._shm_name: Optional[str] = None
         self._local_buf: Optional[bytearray] = None
         self.size = None
         self._own = False
@@ -344,11 +425,10 @@ class SlickQueue:
                     raise ValueError("size and element_size required when creating")
                 total = self._layout_data_offset() + self.element_size * self.size
                 try:
-                    self._shm = SharedMemory(name=self.name, create=True, size=total)
-                    # print(f"**** create new shm {self.name}")
+                    self._shm = _open_shm(self.name, create=True, size=total)
                 except FileExistsError:
-                    # print(f"**** shm already exists, opening {self.name}")
-                    self._shm = SharedMemory(name=self.name, create=False)
+                    self._shm = _open_shm(self.name, create=False)
+                self._shm_name = self._shm._name
 
                 # Use CAS on init_state to determine ownership (matches C++ queue.h:618-648)
                 buf = self._shm.buf
@@ -428,7 +508,8 @@ class SlickQueue:
                     raise ValueError("element_size must be provided when opening existing shared memory")
 
                 # Open existing shared memory (size parameter not needed/ignored)
-                self._shm = SharedMemory(name=self.name, create=False)
+                self._shm = _open_shm(self.name, create=False)
+                self._shm_name = self._shm._name
                 buf = self._shm.buf
 
                 # Wait for initialization to complete (matches C++ queue.h:558-562)
@@ -1199,18 +1280,88 @@ class SlickQueue:
             pass
 
     def unlink(self) -> None:
-        """Unlink (delete) the shared memory segment.
+        """Unlink (delete) the shared memory segment this queue is attached to.
 
-        Only applicable for shared memory mode. Does nothing for local memory mode.
+        Only applicable for shared memory mode; a no-op for local memory mode. No
+        queue ever does this on its own - not close(), not the context manager and
+        not process exit - so call it from the process that coordinates the queue's
+        lifetime, once no peer will attach again.
+
+        Valid after :meth:`close`, which is the documented ``shared_memory`` idiom -
+        close every handle, then unlink the name once. Deleting a name never touches
+        mappings that already exist, open or closed. Unlinking twice is a no-op, so a
+        repeat cannot delete a segment a later run has since created under the same
+        name; :meth:`remove_shm` is the C++-style call that unlinks on every call.
+        """
+        prefixed = self._shm_name
+        if prefixed is None:
+            return
+        self._shm_name = None  # unlink once, however many times this is called
+        SlickQueue.remove(prefixed)
+
+    def remove_shm(self) -> bool:
+        """Unlink this queue's segment name so the next queue created with it starts
+        fresh. Matches C++ ``remove_shm()``.
+
+        Mappings that are already open, including this queue's own, stay valid until
+        they are closed. Unlike :meth:`unlink` it unlinks by name on every call, so
+        it deletes whatever holds the name at the time.
+
+        After this call :meth:`unlink` is a no-op, whatever the result: a name
+        removed here, or one already gone, can be taken by a replacement segment,
+        which the pending unlink() would otherwise delete.
+
+        Returns:
+            True if the name was removed; False for a local-memory queue or if
+            removal failed (on POSIX, typically because the name is already gone).
+            Always True for a shared queue on Windows, where the segment is freed
+            when its last handle closes and there is no name to remove.
         """
         if not self.use_shm:
-            return  # Nothing to unlink for local memory
+            return False
+        self._shm_name = None  # unlink() is done with this name - see above
+        return SlickQueue.remove(self.name)
 
+    @staticmethod
+    def remove(name: str) -> bool:
+        """Unlink a shared memory segment by name without attaching to it. Matches
+        C++ ``slick::shm::shared_memory::remove()``.
+
+        Typically called once at startup to clear a segment a previous run left
+        behind, which a creator would otherwise reattach to with its old contents::
+
+            SlickQueue.remove("my_queue")
+            q = SlickQueue(name="my_queue", size=1024, element_size=64)
+
+        A leading ``/`` is accepted, so the value of :meth:`get_shm_name` can be
+        passed back.
+
+        Returns:
+            True if the segment was removed (always True on Windows).
+
+        Warning:
+            Only call this when no process will attach again. On POSIX the name is
+            unlinked immediately, so the next creator gets a fresh segment while any
+            process still mapped to the old one keeps reading the orphaned copy. On
+            Windows this is a no-op - a section disappears once its last handle
+            closes.
+        """
+        if name.startswith('/'):
+            name = name[1:]
+        if sys.platform == 'win32':
+            return True
+        # Straight to shm_unlink rather than SharedMemory.unlink(), which before
+        # Python 3.13 also retracts a tracker registration this module never keeps -
+        # see _open_shm().
         try:
-            if self._shm:
-                self._shm.unlink()
-        except Exception:
-            pass
+            from _posixshmem import shm_unlink
+        except ImportError:  # pragma: no cover - POSIX always has it
+            return False
+        try:
+            shm_unlink('/' + name)
+        except OSError:  # not there, or not ours to unlink
+            return False
+        return True
 
     def __enter__(self):
         """Context manager entry."""

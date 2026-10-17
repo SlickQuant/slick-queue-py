@@ -1,5 +1,79 @@
 # Changelogs
 
+## [v2.3.0] - 2026-10-17
+
+Tracks C++ slick-queue v2.3.0: no queue removes its shared-memory segment on its
+own any more, and `remove_shm()` is how the coordinating process does. The
+version moves from 2.1.0 to 2.3.0 to stay on the C++ number. C++ v2.2.0 added
+only `shm_name()`, which Python already had as `get_shm_name()`. The
+shared-memory layout is unchanged, so 2.1.0 peers in either language
+interoperate as before.
+
+### Segment lifetime (behavior change)
+
+- On POSIX, a segment is no longer unlinked when the process that created it
+  exits. `SharedMemory` registered every segment with `multiprocessing`'s
+  resource tracker, which unlinks what is registered when the process exits, so
+  a creator that exited first stranded every peer still attached on an orphaned
+  mapping, while its restart silently created a fresh segment under the same
+  name that those peers never saw. C++ v2.3.0 stopped its destructor doing the
+  same. A name now lives until `unlink()`, `remove_shm()` or
+  `SlickQueue.remove(name)`, and a restarted process reattaches to the existing
+  segment and keeps its contents. Windows is unaffected: a section dies with its
+  last handle.
+- The queue sends the resource tracker nothing at all: `track=False` on Python
+  3.13+, and on older POSIX Pythons a `SharedMemory` subclass that maps the
+  segment without registering it. With no register/unregister pair there is
+  nothing to race between threads, or between `multiprocessing` children, which
+  share their parent's tracker.
+- Migration: code that relied on the cleanup at exit now leaves segments in
+  `/dev/shm`, and its next run attaches to them - a creator joins the existing
+  segment instead of initializing it, the contents are the old run's, and a
+  creator with a different geometry raises `ValueError`. Call `SlickQueue.remove(name)` at startup for a clean start, or
+  `unlink()` / `remove_shm()` at shutdown once no peer will attach again.
+
+### Added
+
+- `remove_shm() -> bool`, matching C++: unlinks the segment's name so the next
+  queue created with it starts fresh, leaving open mappings - this queue's own
+  included - valid. It unlinks by name on every call, and leaves `unlink()`
+  nothing to do afterwards, so a later `unlink()` cannot delete a replacement
+  created under the name. Returns `False` for a local-memory queue or when the
+  name is already gone, and always `True` for a shared queue on Windows.
+- `SlickQueue.remove(name) -> bool`, matching C++
+  `slick::shm::shared_memory::remove()`: unlinks a segment by name without
+  attaching to it. Accepts the `/`-prefixed value of `get_shm_name()`, and is
+  always `True` on Windows.
+
+### Fixed
+
+- `unlink()` was a silent no-op once `close()` had run, because `close()` drops
+  the `SharedMemory` object it went through. The documented `shared_memory`
+  idiom - close every handle, then unlink the name once - therefore leaked the
+  segment on POSIX. The name is now kept alongside the mapping, so `unlink()`
+  works after `close()`, and repeating it is a no-op, so it cannot delete a
+  segment a later run has created under the same name.
+- Before Python 3.13 on POSIX, a process that only attached to a queue unlinked
+  its segment when it exited, because attaching registered the name with that
+  process's resource tracker too.
+
+### Tests
+
+- New `tests/test_segment_lifetime.py` with 12 tests, registered with CTest:
+  `unlink()` after `close()` and repeated, `close()` and the context manager
+  keeping the segment, `remove_shm()` on local and shared queues, `unlink()`
+  after `remove_shm()` sparing a replacement segment, `remove()` by name, a
+  creator's and an attacher's exit in a fresh interpreter, no resource-tracker
+  traffic at all, a child forked while another thread is constructing a queue,
+  and spawned children attaching at once.
+- `test_traits.py` and `test_items_per_slot.py` open their hand-built raw
+  segments through the library's opener, so those handles and the queue no
+  longer both claim a name in the resource tracker.
+
+Checked against C++ slick-queue v2.3.0 with the interop tests on Windows and on
+Linux, run twice on Linux so a segment left behind would fail the second run,
+and on Linux under Python 3.12 (the subclass) and 3.14 (`track=False`).
+
 ## [v2.1.0] - 2026-09-24
 
 Tracks C++ slick-queue v2.1.0. Adds `items_per_slot`, so one control slot can
