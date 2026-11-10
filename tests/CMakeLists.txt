@@ -38,6 +38,9 @@ target_link_libraries(cpp_multi_producer PRIVATE slick::queue)
 add_executable(cpp_read_last_tester cpp_read_last_tester.cpp)
 target_link_libraries(cpp_read_last_tester PRIVATE slick::queue)
 
+add_executable(cpp_spsc_tester cpp_spsc_tester.cpp)
+target_link_libraries(cpp_spsc_tester PRIVATE slick::queue)
+
 # Platform-specific linking and compilation flags
 if(UNIX AND NOT APPLE)
     # Link rt library on Linux (not needed on macOS)
@@ -46,6 +49,7 @@ if(UNIX AND NOT APPLE)
     target_link_libraries(cpp_work_stealing_consumer PRIVATE pthread rt)
     target_link_libraries(cpp_multi_producer PRIVATE pthread rt)
     target_link_libraries(cpp_read_last_tester PRIVATE pthread rt)
+    target_link_libraries(cpp_spsc_tester PRIVATE pthread rt)
 elseif(APPLE)
     # macOS only needs pthread
     target_link_libraries(cpp_producer PRIVATE pthread)
@@ -53,6 +57,7 @@ elseif(APPLE)
     target_link_libraries(cpp_work_stealing_consumer PRIVATE pthread)
     target_link_libraries(cpp_multi_producer PRIVATE pthread)
     target_link_libraries(cpp_read_last_tester PRIVATE pthread)
+    target_link_libraries(cpp_spsc_tester PRIVATE pthread)
 endif()
 
 # Add Python interop tests
@@ -159,6 +164,18 @@ add_test(
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 )
 
+add_test(
+    NAME spsc_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/test_spsc.py
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+)
+
+add_test(
+    NAME spsc_interop_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/test_spsc_interop.py
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+)
+
 # Set timeouts for all tests to prevent CI hangs
 set_tests_properties(
     atomic_ops_test
@@ -178,5 +195,7 @@ set_tests_properties(
     wrap_invariants_test
     items_per_slot_test
     segment_lifetime_test
+    spsc_test
+    spsc_interop_test
     PROPERTIES TIMEOUT 120
 )

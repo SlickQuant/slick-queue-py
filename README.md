@@ -1,6 +1,6 @@
 # slick-queue-py
 
-Python implementation of SlickQueue - a lock-free multi-producer multi-consumer (MPMC) queue with C++ interoperability through shared memory.
+Python implementation of SlickQueue - a lock-free multi-producer multi-consumer (MPMC) queue, plus a lossless single-producer single-consumer (SPSC) queue, with C++ interoperability through shared memory.
 
 This is the Python binding for the [SlickQueue C++ library](https://github.com/SlickQuant/slick-queue). The Python implementation maintains exact binary compatibility with the C++ version, enabling seamless interprocess communication between Python and C++ applications.
 
@@ -14,6 +14,8 @@ This is the Python binding for the [SlickQueue C++ library](https://github.com/S
   - **Local Memory Mode**: In-process queue using local memory (no shared memory overhead)
   - **Shared Memory Mode**: Inter-process queue for interprocess communication
 - **Lock-Free Multi-Producer Multi-Consumer**: True MPMC support using atomic operations
+- **Lossless SPSC Queue**: `SpscQueue` ports C++ `slick::spsc_queue`. It never overwrites an
+  unread element and reports a full ring to the producer instead. See [SpscQueue](#spscqueue)
 - **C++/Python Interoperability**: Python and C++ processes can share the same queue
 - **Cross-Platform**: Windows and Linux/macOS support (x86-64)
 - **Memory Layout Compatible**: Exact binary compatibility with C++ `slick::queue<T>`
@@ -606,6 +608,51 @@ sends the tracker nothing at all: `track=False` on Python 3.13+, and on older PO
 `SharedMemory` subclass that maps the segment without registering it, so there is no
 register/unregister pair to race between threads or between processes sharing one tracker.
 
+### SpscQueue
+
+A lossless single-producer single-consumer ring, compatible with C++ `slick::spsc_queue<T>`. One
+thread or process produces and one consumes. Unlike `SlickQueue` it never overwrites an unread
+element: `try_reserve()` reports a full ring instead.
+
+```python
+import struct
+from slick_queue_py import SpscQueue
+
+q = SpscQueue(name='ticks', size=1024, element_size=8)  # create, or open with the same geometry
+peer = SpscQueue(name='ticks', element_size=8)          # attach, adopting the segment's size
+local = SpscQueue(size=1024, element_size=8)            # local memory
+
+# Producer
+i = q.try_reserve()                 # SpscQueue.invalid_index when full; reserve() waits instead
+if i != SpscQueue.invalid_index:
+    q[i][:8] = struct.pack('<Q', 42)
+    q.publish(i)
+
+# Consumer
+data = peer.read()                  # next element as bytes, or None
+data, dropped = peer.read_last()    # newest element, and how many unread ones it skipped
+```
+
+- `reserve(n)` and `try_reserve(n)` reserve `n` separate elements. Write element `k` through
+  `q[i + k]`, because a batch may wrap around the end of the ring. Publish in reservation order.
+  Publishing a later batch first also exposes the earlier one, and publishing the earlier one
+  afterwards is a no-op.
+- `read()` and `read_last()` copy the element and hand its slot back before they return. C++ holds
+  the slot until the consumer's next call, so here the full `size` is always usable and there is no
+  `release()`.
+- `read_last()` loads the producer's tail and moves the read cursor there, so its cost doesn't grow
+  with the backlog. It returns `(None, 0)` if nothing was published since the last read. Note
+  that the second item counts skipped elements, where `SlickQueue.read_last()` returns a size.
+- Both cursors live in the segment, and a peer that reattaches resumes where the previous one
+  stopped. Each object caches its own side's cursor, so keep one live object per side. After
+  another process has produced or consumed, attach a fresh object rather than reusing an old one.
+- `reset()` empties the queue. It isn't thread-safe, and a peer in another process must reattach.
+- `close()`, `unlink()`, `remove_shm()`, `SpscQueue.remove(name)`, `get_shm_name()` and the
+  context manager behave as they do for `SlickQueue`. Using the queue after `close()` raises
+  `RuntimeError("queue is closed")`.
+- `traits=` takes an `SpscQueueTraits` subclass. Its one setting is `enable_cpu_relax` (default
+  `True`), which yields the GIL while `reserve()` waits. `q.traits` is a read-only snapshot.
+
 ### AtomicCursor
 
 The `AtomicCursor` class enables multi-consumer work-stealing patterns by providing an atomic read cursor that multiple consumers can coordinate through. Works in both local mode (multi-threading) and shared memory mode (multi-process).
@@ -781,6 +828,34 @@ Bits 2-3 of the nibble are reserved and must be 0; a marker that sets one is rej
 newer than this build understands. Segments created before slick-queue v1.4.0 carry no
 marker at all and are rejected at attach time.
 
+### SpscQueue layout
+
+`SpscQueue` matches C++ `slick::spsc_queue<T>`. Each cursor sits on its own 128-byte line on every
+platform:
+
+```
+Offset | Size          | Content
+-------|---------------|------------------
+0      | 8 bytes       | reserved (0)
+8      | 4 bytes       | uint32_t size (queue capacity)
+12     | 4 bytes       | uint32_t element_size
+16     | 8 bytes       | reserved (0)
+24     | 4 bytes       | uint32_t header_magic - 'SLS0' (0x534C5330)
+28     | 20 bytes      | reserved (0)
+48     | 4 bytes       | uint32_t init_state (atomic)
+52     | 76 bytes      | padding (to 128)
+128    | 8 bytes       | uint64_t tail (atomic), written by the producer
+136    | 120 bytes     | padding
+256    | 8 bytes       | uint64_t head (atomic), written by the consumer
+264    | 120 bytes     | padding (to 384)
+384    | elem*size     | data array
+```
+
+`size`, `element_size`, the marker and `init_state` sit at the same offsets as in a `SlickQueue`
+segment. Each queue type therefore turns the other's segment away at attach time, with *"holds a
+slick::spsc_queue"* or *"holds a slick::queue"*, instead of timing out. The marker's low nibble is
+reserved for future layout features and must be 0. The C++ side requires `alignof(T) <= 128`.
+
 ## Platform Support
 
 ### Fully Supported (Lock-Free)
@@ -923,6 +998,9 @@ python tests/test_wrap_invariants.py
 
 # Segment lifetime: unlink(), remove_shm(), remove(), process exit
 python tests/test_segment_lifetime.py
+
+# SpscQueue, local and shared memory
+python tests/test_spsc.py
 ```
 
 Or run everything with pytest:
@@ -951,6 +1029,9 @@ python tests/test_interop.py --test cpp_producer_python_consumer
 python tests/test_interop.py --test multi_producer_interop
 python tests/test_interop.py --test stress_interop
 python tests/test_interop.py --test cpp_shm_creation
+
+# SpscQueue against C++ slick::spsc_queue (uses cpp_spsc_tester)
+python tests/test_spsc_interop.py
 ```
 
 The interop tests verify:
@@ -1016,6 +1097,7 @@ queue so consumers keep up, and use `loss_count()` to detect when they have not.
 | read(atomic cursor) multi-consumer | ✅ | ✅ |
 | Feature traits | Template parameter | `traits=` argument |
 | Shared layout marker | `'SLQ1'` / `'SLQ0'` | Same, and validated against C++ peers |
+| Lossless SPSC queue | `slick::spsc_queue<T>` | `SpscQueue`, same `'SLS0'` layout |
 
 ## Contributing
 

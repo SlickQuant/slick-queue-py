@@ -25,11 +25,16 @@ Feature Configuration (Traits):
   maintained, 'SLQ0' when it is not) and every attacher matches it against its
   own configuration, raising RuntimeError on a mismatch.
 
+Single-Producer Single-Consumer:
+- :class:`SpscQueue` ports C++ ``slick::spsc_queue<T>`` (slick-queue v2.4.0), a
+  lossless ring that reports a full ring to the producer instead of overwriting.
+  Its segments carry the marker 'SLS0', and each queue type rejects the other's.
+
 Supported on Python 3.8+ (uses multiprocessing.shared_memory).
 """
 from __future__ import annotations
 
-__version__ = '2.3.0'
+__version__ = '2.4.0'
 
 import inspect
 import mmap
@@ -168,6 +173,19 @@ INIT_STATE_READY = 3
 # Invalid index constant
 K_INVALID_INDEX = 2**64 - 1
 
+# Marker prefixes: three ASCII bytes, with the feature nibble masked off. Matches C++
+# detail/queue_common.hpp, so each queue type names the other's segment in its error.
+QUEUE_MAGIC_PREFIX = 0x534C5130  # 'SLQ0', SlickQueue / slick::queue
+SPSC_MAGIC_PREFIX = 0x534C5330   # 'SLS0', SpscQueue / slick::spsc_queue
+
+# SpscQueue layout (matches C++ slick/spsc_queue.hpp). size, element_size, the marker
+# and init_state keep the SlickQueue offsets above; the cursors sit on their own
+# 128-byte lines and the data array follows the 384-byte header.
+SPSC_HEADER_MAGIC = SPSC_MAGIC_PREFIX  # feature nibble 0: no optional features yet
+SPSC_TAIL_OFFSET = 128  # uint64, written by the producer
+SPSC_HEAD_OFFSET = 256  # uint64, written by the consumer
+SPSC_HEADER_SIZE = 384
+
 # slot: atomic_uint64 data_index; uint32 size; 4 bytes padding => 16 bytes
 #
 # slot.size became a std::atomic<uint32_t> on the C++ side in v2.0.0. It is
@@ -252,6 +270,9 @@ _TRAIT_NAMES = (
     "enable_cpu_relax",
 )
 
+# SpscQueueTraits has one setting, shared with QueueTraits.
+_SPSC_TRAIT_NAMES = ("enable_cpu_relax",)
+
 
 class _FrozenTraits:
     """An immutable snapshot of a traits type, taken at queue construction.
@@ -266,14 +287,17 @@ class _FrozenTraits:
     atomic had never been created.
 
     Snapshotting removes the whole class of bug rather than guarding each site.
+
+    names lists the traits the queue type has; a name it lacks raises AttributeError.
     """
 
-    __slots__ = _TRAIT_NAMES
+    __slots__ = tuple(dict.fromkeys(_TRAIT_NAMES + _SPSC_TRAIT_NAMES)) + ("_names",)
 
-    def __init__(self, traits):
+    def __init__(self, traits, names=_TRAIT_NAMES):
         # object.__setattr__ to get past this class's own read-only __setattr__.
         # The values are already known to be bools: validate_traits() runs first.
-        for name in _TRAIT_NAMES:
+        object.__setattr__(self, "_names", names)
+        for name in names:
             object.__setattr__(self, name, getattr(traits, name))
 
     def __setattr__(self, name, value):
@@ -286,16 +310,17 @@ class _FrozenTraits:
         raise AttributeError("traits are read-only after construction")
 
     def __repr__(self):
-        inner = ", ".join(f"{n}={getattr(self, n)}" for n in _TRAIT_NAMES)
+        inner = ", ".join(f"{n}={getattr(self, n)}" for n in self._names)
         return f"traits({inner})"
 
     def __eq__(self, other):
         if not isinstance(other, _FrozenTraits):
             return NotImplemented
-        return all(getattr(self, n) == getattr(other, n) for n in _TRAIT_NAMES)
+        return self._names == other._names and all(
+            getattr(self, n) == getattr(other, n) for n in self._names)
 
     def __hash__(self):
-        return hash(tuple(getattr(self, n) for n in _TRAIT_NAMES))
+        return hash((self._names,) + tuple(getattr(self, n) for n in self._names))
 
 
 def validate_traits(traits) -> None:
@@ -309,11 +334,17 @@ def validate_traits(traits) -> None:
     Raises:
         TypeError: If a trait is missing or is not a bool.
     """
-    for name in _TRAIT_NAMES:
+    _check_traits(traits, _TRAIT_NAMES, "QueueTraits")
+
+
+def _check_traits(traits, names, base_name) -> None:
+    """validate_traits() for any traits type: names are the required bool attributes,
+    base_name the class the error tells the caller to derive from."""
+    for name in names:
         if not hasattr(traits, name):
             raise TypeError(
                 f"traits type {getattr(traits, '__name__', traits)!r} is missing "
-                f"required attribute '{name}'; derive from QueueTraits"
+                f"required attribute '{name}'; derive from {base_name}"
             )
         value = getattr(traits, name)
         if not isinstance(value, bool):
@@ -323,7 +354,239 @@ def validate_traits(traits) -> None:
             )
 
 
-class SlickQueue:
+def _wait_for_ready(buf, accept_other=None) -> bool:
+    """Poll init_state for up to ~2s. accept_other(state, elapsed_ms) may accept a state
+    other than ready, which SlickQueue uses to recognise pre-v1.4.0 segments. Matches
+    C++ detail::wait_for_ready()."""
+    init_state_atomic = AtomicUInt64(buf, INIT_STATE_OFFSET)
+    max_wait_ms = 2000
+    for i in range(max_wait_ms):
+        state = init_state_atomic.load_acquire()
+        if state == INIT_STATE_READY or (accept_other is not None and accept_other(state, i)):
+            return True
+        time.sleep(0.001)
+    return False
+
+
+class _ShmQueueBase:
+    """What SlickQueue and SpscQueue share: the segment name, opening and closing the
+    mapping, removing the name, element access and the context manager.
+
+    A subclass sets ``use_shm``, ``_shm``, ``_shm_name`` and ``_local_buf`` through
+    ``_init_name()``, and ``_buf``, ``mask``, ``element_size``, ``_data_offset`` and
+    ``_enable_cpu_relax`` once its layout is known. It releases its own atomics in
+    ``_release_views()``.
+    """
+
+    def _init_name(self, name: Optional[str]) -> None:
+        # Store the original user-provided name (without / prefix)
+        # Python's SharedMemory will add the / prefix on POSIX systems automatically.
+        # We strip any leading / to avoid double-prefixing (//name) on POSIX systems.
+        self.name = name
+        if self.name is not None and self.name.startswith('/'):
+            # Strip leading / if user provided it - Python's SharedMemory will add it back on POSIX
+            self.name = self.name[1:]
+
+        # macOS has a 31-character limit for POSIX shared memory names (including leading /)
+        # Check the length that will be used (with / prefix on POSIX systems)
+        if self.name is not None and sys.platform == 'darwin':
+            # On macOS, Python's SharedMemory will prepend /, so check total length
+            final_name = '/' + self.name
+            if len(final_name) > 31:
+                raise ValueError(f"Shared memory name '{final_name}' is {len(final_name)} characters, "
+                               f"but macOS has a 31-character limit. Please use a shorter name.")
+
+        self.use_shm = name is not None
+        self._shm: Optional[SharedMemory] = None
+        # Tracker-form name of the mapping. Outlives close(), which drops _shm, so
+        # unlink() still knows what to unlink - see unlink().
+        self._shm_name: Optional[str] = None
+        self._local_buf: Optional[bytearray] = None
+
+    def _create_or_open_shm(self, total: int) -> memoryview:
+        """Create the segment, or open it if the name exists, and return its buffer."""
+        try:
+            self._shm = _open_shm(self.name, create=True, size=total)
+        except FileExistsError:
+            self._shm = _open_shm(self.name, create=False)
+        self._shm_name = self._shm._name
+        return self._shm.buf
+
+    def _attach_shm(self) -> memoryview:
+        """Open an existing segment and return its buffer."""
+        self._shm = _open_shm(self.name, create=False)
+        self._shm_name = self._shm._name
+        return self._shm.buf
+
+    def _cpu_relax(self) -> None:
+        """
+        Backoff hint on a contended CAS loop (C++ cpu_relax()).
+
+        There is no pause intrinsic reachable from pure Python; releasing the GIL so
+        another thread can make progress is the closest equivalent, and is what the
+        non-x86 C++ fallback (std::this_thread::yield) does.
+        """
+        if self._enable_cpu_relax:
+            time.sleep(0)
+
+    @staticmethod
+    def _to_hex(value: int) -> str:
+        """Format a marker word the way the C++ error messages do."""
+        return "0x%08X" % (value & 0xFFFFFFFF)
+
+    def __getitem__(self, index: int) -> memoryview:
+        off = self._data_offset + (index & self.mask) * self.element_size
+        return self._buf[off: off + self.element_size]
+
+    def get_shm_name(self) -> Optional[str]:
+        """
+        Get the actual shared memory name for C++ interop.
+
+        Returns the name with POSIX / prefix (required by C++ shm_open).
+        On POSIX systems (Linux/macOS), this returns the name with the / prefix.
+        On Windows, it returns the name without modification.
+
+        Returns:
+            The shared memory name that C++ code should use to open the queue.
+            On POSIX systems, this will have the / prefix that shm_open() requires.
+        """
+        if self._shm is not None:
+            # Use the actual name from SharedMemory (which has / prefix on POSIX)
+            return self._shm._name
+        elif self.name is not None:
+            # If SharedMemory not created yet, construct the expected name
+            # On POSIX, need to add / prefix; on Windows, use as-is
+            if sys.platform != 'win32':
+                return '/' + self.name
+            else:
+                return self.name
+        return None
+
+    def _release_views(self) -> None:
+        """Drop the subclass's atomic wrappers over the buffer, before it is closed."""
+
+    def close(self) -> None:
+        """Close the queue connection.
+
+        For shared memory mode: releases all references to avoid 'exported pointers exist' errors.
+        For local memory mode: releases local buffer.
+        """
+        try:
+            self._release_views()
+
+            self._buf = None
+
+            # Close shared memory if using it
+            if self.use_shm and self._shm:
+                try:
+                    # prevent Exception ignored in: <function SharedMemory.__del__ at 0x00000176D1BFA8E0>
+                    self._shm._mmap = None
+                    self._shm.close()
+                    self._shm = None
+                except Exception:
+                    pass
+
+            # Clear local buffer if using it
+            if not self.use_shm and self._local_buf:
+                self._local_buf = None
+        except Exception:  # close() never raises, and library code does not print
+            pass
+
+    def unlink(self) -> None:
+        """Unlink (delete) the shared memory segment this queue is attached to.
+
+        Only applicable for shared memory mode; a no-op for local memory mode. No
+        queue ever does this on its own - not close(), not the context manager and
+        not process exit - so call it from the process that coordinates the queue's
+        lifetime, once no peer will attach again.
+
+        Valid after :meth:`close`, which is the documented ``shared_memory`` idiom -
+        close every handle, then unlink the name once. Deleting a name never touches
+        mappings that already exist, open or closed. Unlinking twice is a no-op, so a
+        repeat cannot delete a segment a later run has since created under the same
+        name; :meth:`remove_shm` is the C++-style call that unlinks on every call.
+        """
+        prefixed = self._shm_name
+        if prefixed is None:
+            return
+        self._shm_name = None  # unlink once, however many times this is called
+        _ShmQueueBase.remove(prefixed)
+
+    def remove_shm(self) -> bool:
+        """Unlink this queue's segment name so the next queue created with it starts
+        fresh. Matches C++ ``remove_shm()``.
+
+        Mappings that are already open, including this queue's own, stay valid until
+        they are closed. Unlike :meth:`unlink` it unlinks by name on every call, so
+        it deletes whatever holds the name at the time.
+
+        After this call :meth:`unlink` is a no-op, whatever the result: a name
+        removed here, or one already gone, can be taken by a replacement segment,
+        which the pending unlink() would otherwise delete.
+
+        Returns:
+            True if the name was removed; False for a local-memory queue or if
+            removal failed (on POSIX, typically because the name is already gone).
+            Always True for a shared queue on Windows, where the segment is freed
+            when its last handle closes and there is no name to remove.
+        """
+        if not self.use_shm:
+            return False
+        self._shm_name = None  # unlink() is done with this name - see above
+        return _ShmQueueBase.remove(self.name)
+
+    @staticmethod
+    def remove(name: str) -> bool:
+        """Unlink a shared memory segment by name without attaching to it. Matches
+        C++ ``slick::shm::shared_memory::remove()``.
+
+        Typically called once at startup to clear a segment a previous run left
+        behind, which a creator would otherwise reattach to with its old contents::
+
+            SlickQueue.remove("my_queue")
+            q = SlickQueue(name="my_queue", size=1024, element_size=64)
+
+        A leading ``/`` is accepted, so the value of :meth:`get_shm_name` can be
+        passed back.
+
+        Returns:
+            True if the segment was removed (always True on Windows).
+
+        Warning:
+            Only call this when no process will attach again. On POSIX the name is
+            unlinked immediately, so the next creator gets a fresh segment while any
+            process still mapped to the old one keeps reading the orphaned copy. On
+            Windows this is a no-op - a section disappears once its last handle
+            closes.
+        """
+        if name.startswith('/'):
+            name = name[1:]
+        if sys.platform == 'win32':
+            return True
+        # Straight to shm_unlink rather than SharedMemory.unlink(), which before
+        # Python 3.13 also retracts a tracker registration this module never keeps -
+        # see _open_shm().
+        try:
+            from _posixshmem import shm_unlink
+        except ImportError:  # pragma: no cover - POSIX always has it
+            return False
+        try:
+            shm_unlink('/' + name)
+        except OSError:  # not there, or not ours to unlink
+            return False
+        return True
+
+    def __enter__(self):
+        """Context manager entry."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):  # noqa: U100
+        """Context manager exit - ensures proper cleanup."""
+        self.close()
+        return False
+
+
+class SlickQueue(_ShmQueueBase):
     """A fixed-size ring queue compatible with C++ SlickQueue.
 
     Supports two modes:
@@ -377,29 +640,7 @@ class SlickQueue:
             else HEADER_MAGIC & ~HEADER_MAGIC_READ_LAST
         )
 
-        # Store the original user-provided name (without / prefix)
-        # Python's SharedMemory will add the / prefix on POSIX systems automatically.
-        # We strip any leading / to avoid double-prefixing (//name) on POSIX systems.
-        self.name = name
-        if self.name is not None and self.name.startswith('/'):
-            # Strip leading / if user provided it - Python's SharedMemory will add it back on POSIX
-            self.name = self.name[1:]
-
-        # macOS has a 31-character limit for POSIX shared memory names (including leading /)
-        # Check the length that will be used (with / prefix on POSIX systems)
-        if self.name is not None and sys.platform == 'darwin':
-            # On macOS, Python's SharedMemory will prepend /, so check total length
-            final_name = '/' + self.name
-            if len(final_name) > 31:
-                raise ValueError(f"Shared memory name '{final_name}' is {len(final_name)} characters, "
-                               f"but macOS has a 31-character limit. Please use a shorter name.")
-
-        self.use_shm = name is not None
-        self._shm: Optional[SharedMemory] = None
-        # Tracker-form name of the mapping. Outlives close(), which drops _shm, so
-        # unlink() still knows what to unlink - see unlink().
-        self._shm_name: Optional[str] = None
-        self._local_buf: Optional[bytearray] = None
+        self._init_name(name)
         self.size = None
         self._own = False
         self._atomic_last_published = None
@@ -424,14 +665,9 @@ class SlickQueue:
                 if element_size is None:
                     raise ValueError("size and element_size required when creating")
                 total = self._layout_data_offset() + self.element_size * self.size
-                try:
-                    self._shm = _open_shm(self.name, create=True, size=total)
-                except FileExistsError:
-                    self._shm = _open_shm(self.name, create=False)
-                self._shm_name = self._shm._name
+                buf = self._create_or_open_shm(total)
 
                 # Use CAS on init_state to determine ownership (matches C++ queue.h:618-648)
-                buf = self._shm.buf
                 init_state_atomic = AtomicUInt64(buf, INIT_STATE_OFFSET)
 
                 # Try to atomically claim ownership by CAS from UNINITIALIZED to INITIALIZING
@@ -508,9 +744,7 @@ class SlickQueue:
                     raise ValueError("element_size must be provided when opening existing shared memory")
 
                 # Open existing shared memory (size parameter not needed/ignored)
-                self._shm = _open_shm(self.name, create=False)
-                self._shm_name = self._shm._name
-                buf = self._shm.buf
+                buf = self._attach_shm()
 
                 # Wait for initialization to complete (matches C++ queue.h:558-562)
                 if not self._wait_for_shared_memory_ready(buf):
@@ -665,29 +899,16 @@ class SlickQueue:
         Returns:
             True if initialization completed successfully, False if timed out
         """
-        init_state_atomic = AtomicUInt64(buf, INIT_STATE_OFFSET)
-        max_wait_ms = 2000
         legacy_grace_ms = 5
 
-        for i in range(max_wait_ms):
-            state = init_state_atomic.load_acquire()
-            if state == INIT_STATE_READY:
-                return True
+        def accept_legacy(state, elapsed_ms):
+            if state != INIT_STATE_LEGACY or elapsed_ms < legacy_grace_ms:
+                return False
+            # Legacy format: check if size and element_size are non-zero
+            ss = struct.unpack_from("<I I", buf, SIZE_OFFSET)
+            return ss[0] != 0 and ss[1] != 0
 
-            if state == INIT_STATE_LEGACY and i >= legacy_grace_ms:
-                # Legacy format: check if size and element_size are non-zero
-                ss = struct.unpack_from("<I I", buf, SIZE_OFFSET)
-                if ss[0] != 0 and ss[1] != 0:
-                    return True
-
-            time.sleep(0.001)
-
-        return False
-
-    @staticmethod
-    def _to_hex(value: int) -> str:
-        """Format a marker word the way the C++ error messages do."""
-        return "0x%08X" % (value & 0xFFFFFFFF)
+        return _wait_for_ready(buf, accept_legacy)
 
     def _validate_header_magic(self, buf: memoryview) -> None:
         """
@@ -712,13 +933,19 @@ class SlickQueue:
         a precise error. Here it is only required to agree with that field.
 
         Raises:
-            RuntimeError: If the segment carries no marker (created before v1.4.0),
-                was created with unknown layout features, disagrees about
-                enable_read_last, or its items_per_slot bit disagrees with the field.
+            RuntimeError: If the segment holds a SpscQueue, carries no marker (created
+                before v1.4.0), was created with unknown layout features, disagrees
+                about enable_read_last, or its items_per_slot bit disagrees with the
+                field.
         """
         expected = self._header_magic_expected
         magic = struct.unpack_from("<I", buf, HEADER_MAGIC_OFFSET)[0]
 
+        if (magic & ~HEADER_MAGIC_FEATURE_MASK) == SPSC_MAGIC_PREFIX:
+            raise RuntimeError(
+                f"Shared memory holds a slick::spsc_queue (marker {self._to_hex(magic)}), "
+                "not a slick::queue"
+            )
         if (magic & ~HEADER_MAGIC_FEATURE_MASK) != (HEADER_MAGIC & ~HEADER_MAGIC_FEATURE_MASK):
             raise RuntimeError(
                 "Shared memory does not carry a slick-queue layout marker. Expected "
@@ -752,17 +979,6 @@ class SlickQueue:
         items_per_slot bit. Matches C++ header_magic_expected()."""
         bit = HEADER_MAGIC_ITEMS_PER_SLOT if self.items_per_slot != 1 else 0
         return self._header_magic_expected | bit
-
-    def _cpu_relax(self) -> None:
-        """
-        Backoff hint on a contended CAS loop (C++ cpu_relax()).
-
-        There is no pause intrinsic reachable from pure Python; releasing the GIL so
-        another thread can make progress is the closest equivalent, and is what the
-        non-x86 C++ fallback (std::this_thread::yield) does.
-        """
-        if self._enable_cpu_relax:
-            time.sleep(0)
 
     def _was_reset(self, read_index: int) -> bool:
         """
@@ -807,30 +1023,6 @@ class SlickQueue:
     def _write_slot(self, slot_idx: int, data_index: int, size: int) -> None:
         off = self._control_offset + slot_idx * SLOT_SIZE
         struct.pack_into(SLOT_FMT, self._buf, off, int(data_index), int(size))
-
-    def get_shm_name(self) -> Optional[str]:
-        """
-        Get the actual shared memory name for C++ interop.
-
-        Returns the name with POSIX / prefix (required by C++ shm_open).
-        On POSIX systems (Linux/macOS), this returns the name with the / prefix.
-        On Windows, it returns the name without modification.
-
-        Returns:
-            The shared memory name that C++ code should use to open the queue.
-            On POSIX systems, this will have the / prefix that shm_open() requires.
-        """
-        if self._shm is not None:
-            # Use the actual name from SharedMemory (which has / prefix on POSIX)
-            return self._shm._name
-        elif self.name is not None:
-            # If SharedMemory not created yet, construct the expected name
-            # On POSIX, need to add / prefix; on Windows, use as-is
-            if sys.platform != 'win32':
-                return '/' + self.name
-            else:
-                return self.name
-        return None
 
     # Public API mirroring C++ methods
     def reserve(self, n: int = 1) -> int:
@@ -930,10 +1122,6 @@ class SlickQueue:
                 )
                 if success:
                     break
-
-    def __getitem__(self, index: int) -> memoryview:
-        off = self._data_offset + (index & self.mask) * self.element_size
-        return self._buf[off: off + self.element_size]
 
     def read(self, read_index: Union[int, AtomicCursor]) -> Union[Tuple[Optional[bytes], int, int], Tuple[Optional[bytes], int, int]]:
         """
@@ -1179,7 +1367,8 @@ class SlickQueue:
 
         Returns:
             Tuple of (data_bytes or None, item_size).
-            If no data available returns (None, 0).
+            If no data available returns (None, 0). SpscQueue.read_last() returns
+            (data, dropped) instead: its second item counts skipped elements.
 
         Raises:
             RuntimeError: If traits.enable_read_last is False.
@@ -1238,145 +1427,321 @@ class SlickQueue:
 
         self._loss_count = 0
 
-    def close(self) -> None:
-        """Close the queue connection.
+    def _release_views(self) -> None:
+        # Release atomic wrapper references to the buffer
+        if hasattr(self, '_atomic_reserved') and self._atomic_reserved:
+            self._atomic_reserved.release()
+        self._atomic_reserved = None
 
-        For shared memory mode: releases all references to avoid 'exported pointers exist' errors.
-        For local memory mode: releases local buffer.
-        """
-        try:
-            # Release atomic wrapper references to the buffer
-            if hasattr(self, '_atomic_reserved') and self._atomic_reserved:
-                self._atomic_reserved.release()
-            self._atomic_reserved = None
+        if hasattr(self, '_atomic_slots') and self._atomic_slots:
+            for slot in self._atomic_slots:
+                slot.release()
+        self._atomic_slots = None
 
-            if hasattr(self, '_atomic_slots') and self._atomic_slots:
-                for slot in self._atomic_slots:
-                    slot.release()
-            self._atomic_slots = None
+        # Release last_published atomic if it exists
+        if hasattr(self, '_atomic_last_published') and self._atomic_last_published:
+            self._atomic_last_published.release()
+        self._atomic_last_published = None
 
-            # Release last_published atomic if it exists
-            if hasattr(self, '_atomic_last_published') and self._atomic_last_published:
-                self._atomic_last_published.release()
-            self._atomic_last_published = None
 
-            self._buf = None
+class SpscQueueTraits:
+    """Feature configuration for :class:`SpscQueue`, mirroring C++
+    ``slick::spsc_queue_traits``. Subclass and override what you need."""
 
-            # Close shared memory if using it
-            if self.use_shm and self._shm:
-                try:
-                    # prevent Exception ignored in: <function SharedMemory.__del__ at 0x00000176D1BFA8E0>
-                    self._shm._mmap = None
-                    self._shm.close()
-                    self._shm = None
-                except Exception:
-                    pass
+    #: Yield the GIL while reserve() waits for the consumer to free room. Off, a
+    #: waiting producer holds the GIL until the interpreter's switch interval.
+    enable_cpu_relax = True
 
-            # Clear local buffer if using it
-            if not self.use_shm and self._local_buf:
-                self._local_buf = None
-        except Exception as e:
-            print(e)
-            pass
 
-    def unlink(self) -> None:
-        """Unlink (delete) the shared memory segment this queue is attached to.
+class _Closed:
+    """Stands in for a closed SpscQueue's buffer and atomics, so any later use raises
+    one clear error with no check on the hot path."""
 
-        Only applicable for shared memory mode; a no-op for local memory mode. No
-        queue ever does this on its own - not close(), not the context manager and
-        not process exit - so call it from the process that coordinates the queue's
-        lifetime, once no peer will attach again.
+    __slots__ = ()
 
-        Valid after :meth:`close`, which is the documented ``shared_memory`` idiom -
-        close every handle, then unlink the name once. Deleting a name never touches
-        mappings that already exist, open or closed. Unlinking twice is a no-op, so a
-        repeat cannot delete a segment a later run has since created under the same
-        name; :meth:`remove_shm` is the C++-style call that unlinks on every call.
-        """
-        prefixed = self._shm_name
-        if prefixed is None:
-            return
-        self._shm_name = None  # unlink once, however many times this is called
-        SlickQueue.remove(prefixed)
+    def _closed(self, *args, **kwargs):
+        raise RuntimeError("queue is closed")
 
-    def remove_shm(self) -> bool:
-        """Unlink this queue's segment name so the next queue created with it starts
-        fresh. Matches C++ ``remove_shm()``.
+    load_acquire = store_release = compare_exchange_weak = __getitem__ = _closed
 
-        Mappings that are already open, including this queue's own, stay valid until
-        they are closed. Unlike :meth:`unlink` it unlinks by name on every call, so
-        it deletes whatever holds the name at the time.
+    def release(self) -> None:  # a second close() releases again
+        pass
 
-        After this call :meth:`unlink` is a no-op, whatever the result: a name
-        removed here, or one already gone, can be taken by a replacement segment,
-        which the pending unlink() would otherwise delete.
 
-        Returns:
-            True if the name was removed; False for a local-memory queue or if
-            removal failed (on POSIX, typically because the name is already gone).
-            Always True for a shared queue on Windows, where the segment is freed
-            when its last handle closes and there is no name to remove.
-        """
+_CLOSED = _Closed()
+
+
+class SpscQueue(_ShmQueueBase):
+    """A lossless single-producer single-consumer ring, compatible with C++
+    ``slick::spsc_queue<T>`` (slick-queue v2.4.0).
+
+    Exactly one thread or process produces (reserve/publish) and one consumes
+    (read/read_last). try_reserve() returns ``invalid_index`` when the ring is full
+    instead of overwriting unread elements.
+
+    read() and read_last() copy the element out and hand its slot back before they
+    return, so unlike a C++ pointer nothing stays held between calls: capacity is the
+    full ``size``, and a consumer that reattaches resumes after the last element read.
+
+    Args:
+        name: Shared memory segment name. If None, uses local memory mode.
+        size: Capacity, a power of 2. With a name, creates the segment or opens an
+            existing one with the same geometry; omit it to attach and adopt the
+            segment's size.
+        element_size: Bytes per element, the C++ ``sizeof(T)``. Always required.
+        traits: A :class:`SpscQueueTraits` subclass.
+    """
+
+    invalid_index = K_INVALID_INDEX
+
+    def __init__(self, *, name: Optional[str] = None, size: Optional[int] = None,
+                 element_size: Optional[int] = None, traits=None):
+        if traits is None:
+            traits = SpscQueueTraits
+        _check_traits(traits, _SPSC_TRAIT_NAMES, "SpscQueueTraits")
+        # Snapshot, as SlickQueue does: self.traits describes what this queue does.
+        self.traits = _FrozenTraits(traits, _SPSC_TRAIT_NAMES)
+        self._enable_cpu_relax = self.traits.enable_cpu_relax
+        self._init_name(name)
+        self._own = False
+        self._tail = self._head = None
+        self._data_offset = SPSC_HEADER_SIZE
+
+        if element_size is None:
+            raise ValueError("element_size is required")
+        self.element_size = int(element_size)
+        self.size = None
+        if size is not None:
+            self.size = int(size)
+            if self.size <= 0 or self.size & (self.size - 1):
+                raise ValueError("size must be a power of two")
+        elif not self.use_shm:
+            raise ValueError("size is required for local memory mode")
+
         if not self.use_shm:
-            return False
-        self._shm_name = None  # unlink() is done with this name - see above
-        return SlickQueue.remove(self.name)
+            self._local_buf = bytearray(SPSC_HEADER_SIZE + self.element_size * self.size)
+            buf = memoryview(self._local_buf)
+            self._write_header(buf)
+            struct.pack_into("<I", buf, INIT_STATE_OFFSET, INIT_STATE_READY)
+        elif self.size is not None:
+            buf = self._create_or_open_shm(SPSC_HEADER_SIZE + self.element_size * self.size)
+            init_state = AtomicUInt64(buf, INIT_STATE_OFFSET)
+            while True:
+                claimed, state = init_state.compare_exchange_weak(
+                    INIT_STATE_UNINITIALIZED, INIT_STATE_INITIALIZING)
+                if claimed or state != INIT_STATE_UNINITIALIZED:  # retry a spurious failure
+                    break
+            if claimed:
+                # A segment left uninitialized by a creator that died before claiming
+                # it can be smaller than this geometry. Check before writing a header
+                # for it, and hand the claim back so a creator that fits can take it.
+                try:
+                    self._check_mapping(self.size)
+                except RuntimeError:
+                    init_state.store_release(INIT_STATE_UNINITIALIZED)
+                    self._shm.close()
+                    raise
+                self._own = True
+                self._write_header(buf)
+                init_state.store_release(INIT_STATE_READY)
+            else:
+                self._adopt_existing(buf)
+        else:
+            buf = self._attach_shm()
+            self._adopt_existing(buf)
 
-    @staticmethod
-    def remove(name: str) -> bool:
-        """Unlink a shared memory segment by name without attaching to it. Matches
-        C++ ``slick::shm::shared_memory::remove()``.
+        self._buf = buf
+        self.mask = self.size - 1
+        self._tail = AtomicUInt64(buf, SPSC_TAIL_OFFSET)
+        self._head = AtomicUInt64(buf, SPSC_HEAD_OFFSET)
+        self._sync_cursors()
 
-        Typically called once at startup to clear a segment a previous run left
-        behind, which a creator would otherwise reattach to with its old contents::
+    def _write_header(self, buf) -> None:
+        """Everything but init_state, which the caller publishes last."""
+        struct.pack_into("<I", buf, HEADER_MAGIC_OFFSET, SPSC_HEADER_MAGIC)
+        struct.pack_into("<I I", buf, SIZE_OFFSET, self.size, self.element_size)
+        struct.pack_into("<Q", buf, SPSC_TAIL_OFFSET, 0)
+        struct.pack_into("<Q", buf, SPSC_HEAD_OFFSET, 0)
 
-            SlickQueue.remove("my_queue")
-            q = SlickQueue(name="my_queue", size=1024, element_size=64)
+    def _adopt_existing(self, buf) -> None:
+        """Wait for the creator, then reject a segment of another type, a newer layout
+        or a different geometry, closing the mapping before raising. An attacher
+        (self.size None) adopts the segment's size. Matches C++ validate_existing()."""
+        try:
+            if not _wait_for_ready(buf):
+                raise RuntimeError("Timed out waiting for shared memory initialization")
+            magic = struct.unpack_from("<I", buf, HEADER_MAGIC_OFFSET)[0]
+            prefix = magic & ~HEADER_MAGIC_FEATURE_MASK
+            if prefix == QUEUE_MAGIC_PREFIX:
+                raise RuntimeError(
+                    f"Shared memory holds a slick::queue (marker {self._to_hex(magic)}), "
+                    "not a slick::spsc_queue"
+                )
+            if prefix != SPSC_MAGIC_PREFIX:
+                raise RuntimeError(
+                    "Shared memory does not carry a slick::spsc_queue layout marker. "
+                    f"Expected {self._to_hex(SPSC_HEADER_MAGIC)} but got {self._to_hex(magic)}"
+                )
+            if magic != SPSC_HEADER_MAGIC:
+                raise RuntimeError(
+                    "Shared memory was created with unknown spsc_queue layout features. "
+                    f"Marker {self._to_hex(magic)} is newer than this build understands "
+                    f"({self._to_hex(SPSC_HEADER_MAGIC)})"
+                )
+            size, element_size = struct.unpack_from("<I I", buf, SIZE_OFFSET)
+            if element_size != self.element_size:
+                raise ValueError(
+                    f"Shared memory element size mismatch. Expected {self.element_size} "
+                    f"but got {element_size}")
+            if self.size is not None and size != self.size:
+                raise ValueError(
+                    f"Shared memory size mismatch. Expected {self.size} but got {size}")
+            if size <= 0 or size & (size - 1):
+                raise RuntimeError(f"Shared memory size must be power of 2. Got {size}")
+            self._check_mapping(size)
+        except Exception:
+            self._shm.close()
+            raise
+        self.size = size
 
-        A leading ``/`` is accepted, so the value of :meth:`get_shm_name` can be
-        passed back.
+    def _check_mapping(self, size: int) -> None:
+        """Reject a mapping too small for a ring of size elements."""
+        need = SPSC_HEADER_SIZE + self.element_size * size
+        if self._shm.size < need:
+            raise RuntimeError(
+                f"Shared memory segment is {self._shm.size} bytes but a ring of {size} x "
+                f"{self.element_size}-byte elements needs {need}")
+
+    def _sync_cursors(self) -> None:
+        """Seed both sides' private cursors from the shared ones, so a reattached peer
+        resumes where the previous one stopped."""
+        tail = self._tail.load_acquire()
+        head = self._head.load_acquire()
+        self._tail_local = self._tail_published = self._tail_cache = tail
+        self._head_local = self._head_cache = head
+
+    def _reserve_space(self, n: int) -> int:
+        end = self._tail_local + n
+        if end - self._head_cache > self.size:
+            self._head_cache = self._head.load_acquire()
+            if end - self._head_cache > self.size:
+                return K_INVALID_INDEX
+        index = self._tail_local
+        self._tail_local = end
+        return index
+
+    def try_reserve(self, n: int = 1) -> int:
+        """Producer: reserve n elements without waiting.
 
         Returns:
-            True if the segment was removed (always True on Windows).
-
-        Warning:
-            Only call this when no process will attach again. On POSIX the name is
-            unlinked immediately, so the next creator gets a fresh segment while any
-            process still mapped to the old one keeps reading the orphaned copy. On
-            Windows this is a no-op - a section disappears once its last handle
-            closes.
+            Index of the first element, or ``invalid_index`` if the ring lacks room or
+            n is not in 1..size.
         """
-        if name.startswith('/'):
-            name = name[1:]
-        if sys.platform == 'win32':
-            return True
-        # Straight to shm_unlink rather than SharedMemory.unlink(), which before
-        # Python 3.13 also retracts a tracker registration this module never keeps -
-        # see _open_shm().
-        try:
-            from _posixshmem import shm_unlink
-        except ImportError:  # pragma: no cover - POSIX always has it
-            return False
-        try:
-            shm_unlink('/' + name)
-        except OSError:  # not there, or not ours to unlink
-            return False
-        return True
+        if n <= 0 or n > self.size:
+            return K_INVALID_INDEX
+        return self._reserve_space(n)
 
-    def __enter__(self):
-        """Context manager entry."""
-        return self
+    def reserve(self, n: int = 1) -> int:
+        """Producer: reserve n elements, waiting until the consumer frees room.
 
-    def __exit__(self, exc_type, exc_val, exc_tb):  # noqa: U100
-        """Context manager exit - ensures proper cleanup."""
-        self.close()
-        return False
+        Write element i through ``q[index + i]``; a batch may wrap around the ring.
+
+        Raises:
+            ValueError: If n is not positive.
+            RuntimeError: If n > size.
+        """
+        if n <= 0:
+            raise ValueError("required size must be > 0")
+        if n > self.size:
+            raise RuntimeError(f"required size {n} > queue size {self.size}")
+        while True:
+            index = self._reserve_space(n)
+            if index != K_INVALID_INDEX:
+                return index
+            self._cpu_relax()
+
+    def publish(self, index: int, n: int = 1) -> None:
+        """Producer: make elements [index, index + n) visible to the consumer.
+
+        Publish in reservation order. Publishing a later reservation first also exposes
+        the earlier, unwritten one, and publishing that earlier one afterwards is a no-op.
+        """
+        end = index + n
+        assert end <= self._tail_local, "publish() of an index that was never reserved"
+        # Never rewind tail: the consumer may already have read past a smaller end.
+        if end > self._tail_published:
+            self._tail_published = end
+            self._tail.store_release(end)
+
+    def read(self) -> Optional[bytes]:
+        """Consumer: the next element in FIFO order as a bytes copy, or None if empty.
+        Its slot goes back to the producer before this returns."""
+        head = self._head_local
+        if head == self._tail_cache:
+            self._tail_cache = self._tail.load_acquire()
+            if head == self._tail_cache:
+                return None
+        off = SPSC_HEADER_SIZE + (head & self.mask) * self.element_size
+        data = bytes(self._buf[off: off + self.element_size])
+        self._head_local = head + 1
+        self._head.store_release(head + 1)
+        return data
+
+    def read_last(self) -> Tuple[Optional[bytes], int]:
+        """Consumer: the newest element, dropping every older unread one.
+
+        One load of the producer's tail, however large the backlog. Matches C++
+        ``read_last(uint64_t& dropped)``, with dropped returned instead.
+
+        Returns:
+            (data, dropped): a bytes copy of the newest element and the number of
+            unread elements skipped, or (None, 0) if nothing was published since the
+            last read. Unlike SlickQueue.read_last(), the second item counts skipped
+            elements, not the element's size.
+        """
+        tail = self._tail.load_acquire()
+        self._tail_cache = tail
+        head = self._head_local
+        if tail == head:
+            return None, 0
+        off = SPSC_HEADER_SIZE + ((tail - 1) & self.mask) * self.element_size
+        data = bytes(self._buf[off: off + self.element_size])
+        self._head_local = tail
+        self._head.store_release(tail)
+        return data, tail - head - 1
+
+    def reset(self) -> None:
+        """Empty the queue.
+
+        Not thread-safe: call it while neither side is in use. A peer attached in
+        another process keeps its old cursors and must reattach.
+        """
+        self._tail.store_release(0)
+        self._head.store_release(0)
+        self._sync_cursors()
+
+    def _release_views(self) -> None:
+        for name in ('_tail', '_head'):
+            atomic = getattr(self, name, None)
+            if atomic is not None:
+                atomic.release()
+            setattr(self, name, None)
+
+    def close(self) -> None:
+        """Close the queue. Any later use raises RuntimeError("queue is closed")."""
+        super().close()
+        # No check on the hot path: every ring access goes through these, and an
+        # unknown head makes the next reserve reload it.
+        self._buf = self._tail = self._head = _CLOSED
+        self._head_cache = float('-inf')
 
 
 __all__ = [
     "SlickQueue",
+    "SpscQueue",
     "AtomicCursor",
     "QueueTraits",
+    "SpscQueueTraits",
     "default_queue_traits",
     "validate_traits",
     "__version__",

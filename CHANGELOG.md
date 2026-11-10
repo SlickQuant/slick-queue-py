@@ -1,5 +1,59 @@
 # Changelogs
 
+## [v2.4.0] - 2026-11-09
+
+Tracks C++ slick-queue v2.4.0, which added `slick::spsc_queue`. The `SlickQueue`
+shared-memory layout is unchanged, so 2.3.0 peers in either language interoperate
+with it as before.
+
+### Added
+
+- `SpscQueue`, a port of C++ `slick::spsc_queue<T>`: a lossless single-producer
+  single-consumer ring in local or shared memory. `try_reserve(n)` returns
+  `SpscQueue.invalid_index` when the ring is full and `reserve(n)` waits until the
+  consumer frees room. `publish()` never moves the tail backwards, so publishing an
+  earlier reservation after a later one is a no-op.
+- `read()` returns the next element as `bytes`. `read_last()` returns
+  `(data, dropped)`, the newest element and how many unread ones it skipped, from
+  one load of the producer's tail however large the backlog.
+- Both reads copy the element and hand its slot back before they return. C++ holds
+  the slot until the consumer's next call, so a Python consumer gets the full `size`
+  as capacity, nothing it read is delivered again after it reattaches, and there is
+  no `release()`.
+- `SpscQueueTraits` with one setting, `enable_cpu_relax`, which yields the GIL while
+  `reserve()` waits. `q.traits` is a read-only snapshot, as for `SlickQueue`.
+- The C++ shared-memory layout: a 384-byte header with the tail at offset 128 and the
+  head at 256, then the data array. Size, element size, the `'SLS0'` marker and init
+  state keep the `SlickQueue` offsets. Both cursors live in the segment, so a
+  reattached peer resumes where the previous one stopped.
+- A creator that claims a segment left uninitialized, whose own creator died before
+  claiming it, checks the mapping holds its geometry first. If it doesn't, it raises
+  and hands the claim back, instead of writing a header for a ring the mapping can't
+  hold. Every attacher checks the mapping size too.
+- Using an `SpscQueue` after `close()` raises `RuntimeError("queue is closed")`.
+
+### Changed
+
+- `SlickQueue` attaching to an `SpscQueue` segment now raises "holds a
+  slick::spsc_queue" instead of the generic missing-marker error, matching C++, and
+  `SpscQueue` names a `SlickQueue` segment the same way.
+- Name handling, opening and closing the segment, `unlink()`, `remove_shm()`,
+  `remove()` and the context manager moved into a base class both queues share.
+  `SlickQueue` behaves as before.
+- `close()` still never raises, but no longer prints the exception it swallows.
+
+### Tests
+
+- `tests/test_spsc.py` covers the local and shared-memory API: wraps, a full ring,
+  out-of-order publish, element sizes other than 8, `read_last()` accounting under a
+  concurrent producer, reset, reattach, a too-small leftover segment, use after
+  `close()` and the cross-type marker checks.
+- `tests/test_spsc_interop.py` runs against C++ through the new `cpp_spsc_tester`:
+  data in both directions, attaching to a C++-created segment, `read_last()` from
+  each side, and each language rejecting the other queue type.
+
+Checked against C++ slick-queue v2.4.0 with the interop tests on Windows.
+
 ## [v2.3.0] - 2026-10-17
 
 Tracks C++ slick-queue v2.3.0: no queue removes its shared-memory segment on its

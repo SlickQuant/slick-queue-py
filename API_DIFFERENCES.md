@@ -1,8 +1,8 @@
 # C++ / Python API Differences
 
-This document explains the intentional API differences between the C++ `slick::queue<T>` and Python `SlickQueue` implementations.
+This document explains the intentional API differences between the C++ `slick::queue<T>` and Python `SlickQueue` implementations, and between C++ `slick::spsc_queue<T>` and Python `SpscQueue` (section 8).
 
-Both track the same version line; this document describes slick-queue v2.3.0.
+Both track the same version line; this document describes slick-queue v2.4.0.
 
 ## Core Compatibility
 
@@ -267,6 +267,39 @@ the process exits.
 
 ---
 
+### 8. SpscQueue: Held Slot vs. Copy
+
+**C++:**
+```cpp
+slick::spsc_queue<uint64_t> q("ticks");
+if (uint64_t* v = q.read()) { /* slot held until the next read(), read_last() or release() */ }
+uint64_t dropped = 0;
+uint64_t* last = q.read_last(dropped);
+```
+
+**Python:**
+```python
+q = SpscQueue(name='ticks', element_size=8)
+data = q.read()                 # bytes copy; the slot is already back with the producer
+data, dropped = q.read_last()
+```
+
+**Rationale:** Python copies the element anyway, so once `read()` returns there is nothing
+left to hold, and it hands the slot back at once. A Python consumer therefore gets the full
+`size` as capacity, even at size 1, and has no `release()`. A C++ consumer that exits while
+holding a slot still has that element delivered again to whoever attaches next, Python
+included.
+
+| C++ | Python |
+|-----|--------|
+| `try_reserve()` returns `invalid_index` | Same, as `SpscQueue.invalid_index` |
+| `read()` returns `T*`, `nullptr` when empty | `bytes`, `None` when empty |
+| `read_last(dropped)` with an out-parameter | `read_last()` returns `(data, dropped)` |
+| `release()` | Not needed: nothing is held |
+| `spsc_queue(name)` adopts `size`, and `T` gives the element size | `SpscQueue(name=..., element_size=...)` adopts `size`; `element_size` is always required |
+
+---
+
 ## Interoperability Examples
 
 ### Example 1: C++ Producer → Python Consumer
@@ -363,5 +396,7 @@ int main() {
 | Misconfigured traits | Compile error (concept / `static_assert`) | `TypeError` / `RuntimeError` at runtime | No compile step |
 | Default loss detection | Off in Release | Always on | +0.2% here, and the only overrun signal a caller has |
 | Layout marker | `'SLQ1'` / `'SLQ0'` | Identical, and validated against C++ peers | Shared contract |
+| SPSC `read()` | `T*` held until the next read | `bytes` copy, slot freed at once | Python copies anyway |
+| SPSC `read_last()` dropped count | Out-parameter | Second item of the returned tuple | Python has no pass-by-reference |
 
 **Bottom Line:** The Python API is designed to be Pythonic while maintaining **100% binary compatibility** with C++. All atomic operations and memory layouts are identical, enabling seamless C++/Python interoperability.
