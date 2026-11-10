@@ -10,6 +10,7 @@ import struct
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -162,20 +163,30 @@ def expect_raises(exc_type, fragment, fn):
     raise AssertionError(f"expected {exc_type.__name__} containing {fragment!r}")
 
 
-def _raw_u32(name, offset):
+@contextmanager
+def _raw(name):
     raw = _open_shm(name, create=False)
     try:
-        return struct.unpack_from('<I', raw.buf, offset)[0]
+        yield raw
     finally:
         raw.close()
+
+
+def _raw_u32(name, offset):
+    with _raw(name) as raw:
+        return struct.unpack_from('<I', raw.buf, offset)[0]
 
 
 def _set_raw_u32(name, offset, value):
-    raw = _open_shm(name, create=False)
-    try:
+    with _raw(name) as raw:
         struct.pack_into('<I', raw.buf, offset, value)
-    finally:
-        raw.close()
+
+
+def _mapped_size(name):
+    """Bytes a process opening the segment maps. Windows and macOS round it up to the
+    page size (16 KiB on Apple Silicon); the creator's own size is what it asked for."""
+    with _raw(name) as raw:
+        return raw.size
 
 
 # -- local memory -------------------------------------------------------------------
@@ -492,8 +503,10 @@ def test_claiming_too_small_leftover_segment_raises_and_releases_claim():
         name = s.name("leftover")
         keeper = s.track(SpscQueue(name=name, size=8, element_size=8))  # alive on Windows too
         _set_raw_u32(name, INIT_STATE_OFFSET, INIT_STATE_UNINITIALIZED)
+        # A fixed size may still fit once the OS rounds the segment up to a page.
+        too_big = 1 << (_mapped_size(name) // 8).bit_length()
         expect_raises(RuntimeError, "bytes but",
-                      lambda: SpscQueue(name=name, size=1024, element_size=8))
+                      lambda: SpscQueue(name=name, size=too_big, element_size=8))
         # The failed claim is handed back, so a creator whose geometry fits can take it.
         assert _raw_u32(name, INIT_STATE_OFFSET) == INIT_STATE_UNINITIALIZED
         again = s.track(SpscQueue(name=name, size=8, element_size=8))
